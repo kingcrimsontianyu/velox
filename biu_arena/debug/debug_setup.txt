@@ -1,0 +1,4 @@
+b /opt/velox-build/debug/_deps/cudf-src/cpp/src/io/utilities/datasource.cpp:410
+b /workspace/velox/velox/experimental/cudf/connectors/hive/CudfHiveDataSource.cpp:306
+# b /workspace/velox/velox/exec/tests/utils/TpchQueryBuilder.h:66
+
