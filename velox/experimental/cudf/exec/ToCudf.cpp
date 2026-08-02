@@ -41,6 +41,10 @@
 
 #include <cuda.h>
 
+#ifdef VELOX_ENABLE_S3
+#include "velox/experimental/cudf/connectors/hive/storage_adapters/kvikio/RegisterKvikioS3FileSystem.h"
+#endif
+
 #include <iostream>
 
 static const std::string kCudfAdapterName = "cuDF";
@@ -345,6 +349,13 @@ void registerCudf() {
     registerJitEvaluator(CudfConfig::getInstance().jitExpressionPriority);
   }
 
+#ifdef VELOX_ENABLE_S3
+  // Must run after any plain registerS3FileSystem(), which overwrites the
+  // factory. In prestissimo that holds: PrestoServer::registerFileSystems()
+  // runs before registerVeloxCudf().
+  connector::hive::registerKvikioS3FileSystem();
+#endif
+
   isCudfRegistered = true;
 }
 
@@ -418,6 +429,9 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfTopNBatchSize) != config.end()) {
     topNBatchSize = folly::to<int32_t>(config[kCudfTopNBatchSize]);
+  }
+  if (config.find(kCudfS3UseKvikio) != config.end()) {
+    s3UseKvikio = folly::to<bool>(config[kCudfS3UseKvikio]);
   }
   if (config.find(kCudfTimestampUnit) != config.end()) {
     const auto& unit = config[kCudfTimestampUnit];

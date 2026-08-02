@@ -225,6 +225,22 @@ if(VELOX_ENABLE_S3)
       velox_s3fs
       velox_test_util
   )
+
+  velox_add_cudf_test(
+    NAME velox_cudf_kvikio_s3_read_test
+    SOURCES Main.cpp KvikioS3ReadTest.cpp
+    LIBS
+      velox_cudf_exec_test_lib
+      velox_cudf_kvikio_s3fs
+      velox_exec
+      velox_exec_test_lib
+      velox_file
+      velox_s3fs
+      velox_test_util
+  )
+  target_include_directories(
+    velox_cudf_kvikio_s3_read_test PRIVATE ${AWSSDK_INCLUDE_DIRS}
+  )
 endif()
 
 velox_add_cudf_test(

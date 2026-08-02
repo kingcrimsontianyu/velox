@@ -62,4 +62,8 @@ target_link_libraries(
     velox_test_util
 )
 
+if(VELOX_ENABLE_S3)
+  target_link_libraries(velox_cudf_exec PRIVATE velox_cudf_kvikio_s3fs)
+endif()
+
 target_compile_options(velox_cudf_exec PRIVATE -Wno-missing-field-initializers)

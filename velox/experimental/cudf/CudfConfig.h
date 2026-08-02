@@ -50,6 +50,7 @@ struct CudfConfig {
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
+  static constexpr const char* kCudfS3UseKvikio{"cudf.s3.use_kvikio"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
 
@@ -131,6 +132,12 @@ struct CudfConfig {
   /// "s" (seconds), "ms" (milliseconds), "us" (microseconds), "ns"
   /// (nanoseconds).
   cudf::type_id timestampUnit = cudf::type_id::TIMESTAMP_NANOSECONDS;
+
+  /// Serve S3 reads through KvikIO's libcurl engine instead of the AWS SDK.
+  /// Only affects cold reads: the async data cache sits above the ReadFile
+  /// abstraction, so hot reads never reach either transport.
+  /// Must be set before registerCudf(), which installs the filesystem factory.
+  bool s3UseKvikio{false};
 };
 
 } // namespace facebook::velox::cudf_velox

@@ -13,29 +13,20 @@
 # limitations under the License.
 
 add_library(
-  velox_cudf_hive_connector
-  CudfHiveConfig.cpp
-  CudfHiveConnector.cpp
-  CudfHiveConnectorSplit.cpp
-  CudfHiveDataSink.cpp
-  CudfHiveDataSource.cpp
-  CudfHiveTableHandle.cpp
-  CudfSplitReader.cpp
-  CudfSplitReaderHelpers.cpp
+  velox_cudf_kvikio_s3fs
+  KvikioS3FileSystem.cpp
+  KvikioS3ReadFile.cpp
+  RegisterKvikioS3FileSystem.cpp
 )
 
 target_link_libraries(
-  velox_cudf_hive_connector
-  PRIVATE velox_dwio_common velox_hive_connector
-  PUBLIC cudf::cudf nvtx3::nvtx3-cpp velox_cudf_expression
+  velox_cudf_kvikio_s3fs
+  PRIVATE velox_dwio_common velox_s3fs
+  # cudf::cudf is needed for CudfConfig.h, which includes <cudf/types.hpp>.
+  PUBLIC cudf::cudf kvikio::kvikio velox_file
 )
 
-if(VELOX_ENABLE_ABFS)
-  target_link_libraries(velox_cudf_hive_connector PRIVATE velox_abfs)
-endif()
-
-if(VELOX_ENABLE_S3)
-  add_subdirectory(storage_adapters/kvikio)
-endif()
-
-add_subdirectory(iceberg)
+# S3Util.h (needed for getPath/getBucketAndKeyFromPath) includes AWS SDK
+# headers, but velox_s3fs keeps AWSSDK_INCLUDE_DIRS PRIVATE so they do not
+# propagate to us.
+target_include_directories(velox_cudf_kvikio_s3fs PRIVATE ${AWSSDK_INCLUDE_DIRS})
