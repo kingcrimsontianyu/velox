@@ -24,8 +24,13 @@
 #include "velox/connectors/hive/FileConfig.h"
 #include "velox/connectors/hive/FileConnectorSplit.h"
 #include "velox/connectors/hive/FileTableHandle.h"
+#include "velox/connectors/hive/PartitionValue.h"
 #include "velox/dwio/common/Options.h"
 #include "velox/dwio/common/ReaderFactory.h"
+#include "velox/dwio/dwrf/common/Config.h"
+#ifdef VELOX_ENABLE_PARQUET
+#include "velox/dwio/parquet/common/ParquetConfig.h"
+#endif
 
 namespace facebook::velox::connector::hive {
 
@@ -38,12 +43,13 @@ FormatScopedConfigs makeFormatScopedConfigs(
       dwio::common::FileFormat::UNKNOWN,
       "Cannot build format-specific configs for unknown file format");
 
+  auto connectorConfig = fileConfig.config()->rawConfigsWithPrefix(
+      fmt::format(
+          "{}{}",
+          fileConfig.connectorConfigPrefix(),
+          dwio::common::formatConfigPrefix(fileFormat, ".")));
   return {
-      config::ConfigBase(fileConfig.config()->rawConfigsWithPrefix(
-          fmt::format(
-              "{}{}",
-              fileConfig.connectorConfigPrefix(),
-              dwio::common::formatConfigPrefix(fileFormat, ".")))),
+      config::ConfigBase(std::move(connectorConfig)),
       config::ConfigBase(sessionProperties.rawConfigsWithPrefix(
           dwio::common::formatConfigPrefix(fileFormat, "_")))};
 }
@@ -80,20 +86,10 @@ void configureReaderOptions(
   readerOptions.setFileColumnNamesReadAsLowerCase(
       fileConfig->isFileColumnNamesReadAsLowerCase(sessionProperties));
   readerOptions.setAllowEmptyFile(true);
-  auto columnMappingMode = dwio::common::ColumnMappingMode::kPosition;
-  switch (fileSplit->fileFormat) {
-    case dwio::common::FileFormat::DWRF:
-    case dwio::common::FileFormat::ORC: {
-      columnMappingMode = fileConfig->isOrcUseColumnNames(sessionProperties)
+  readerOptions.setColumnMappingMode(
+      fileConfig->useColumnNames(sessionProperties)
           ? dwio::common::ColumnMappingMode::kName
-          : dwio::common::ColumnMappingMode::kPosition;
-      break;
-    }
-    default:
-      columnMappingMode = dwio::common::ColumnMappingMode::kPosition;
-  }
-
-  readerOptions.setColumnMappingMode(columnMappingMode);
+          : dwio::common::ColumnMappingMode::kPosition);
   readerOptions.setFileSchema(fileSchema);
   readerOptions.setFilePreloadThreshold(fileConfig->filePreloadThreshold());
   readerOptions.setPrefetchRowGroups(fileConfig->prefetchRowGroups());
@@ -218,50 +214,14 @@ bool applyPartitionFilter(
     bool isPartitionDateDaysSinceEpoch,
     const common::Filter* filter,
     bool asLocalTime) {
-  if (type->isDate()) {
-    int32_t result = 0;
-    // days_since_epoch partition values are integers in string format. Eg.
-    // Iceberg partition values.
-    if (isPartitionDateDaysSinceEpoch) {
-      result = folly::to<int32_t>(partitionValue);
-    } else {
-      result = DATE()->toDays(partitionValue);
-    }
-    return applyFilter(*filter, result);
-  }
-
-  switch (type->kind()) {
-    case TypeKind::BIGINT:
-    case TypeKind::INTEGER:
-    case TypeKind::SMALLINT:
-    case TypeKind::TINYINT: {
-      return applyFilter(*filter, folly::to<int64_t>(partitionValue));
-    }
-    case TypeKind::REAL:
-    case TypeKind::DOUBLE: {
-      return applyFilter(*filter, folly::to<double>(partitionValue));
-    }
-    case TypeKind::BOOLEAN: {
-      return applyFilter(*filter, folly::to<bool>(partitionValue));
-    }
-    case TypeKind::TIMESTAMP: {
-      VELOX_DCHECK(type->equivalent(*TIMESTAMP()));
-      auto result = util::fromTimestampString(
-          StringView(partitionValue), util::TimestampParseMode::kPrestoCast);
-      VELOX_CHECK(!result.hasError());
-      if (asLocalTime) {
-        result.value().toGMT(Timestamp::defaultTimezone());
-      }
-      return applyFilter(*filter, result.value());
-    }
-    case TypeKind::VARCHAR:
-    case TypeKind::VARBINARY: {
-      return applyFilter(*filter, partitionValue);
-    }
-    default:
-      VELOX_FAIL(
-          "Bad type {} for partition value: {}", type->kind(), partitionValue);
-  }
+  const auto value = PartitionValue::fromString(
+      partitionValue,
+      *type,
+      asLocalTime ? PartitionValue::TimestampMode::kLocalTime
+                  : PartitionValue::TimestampMode::kUtc,
+      isPartitionDateDaysSinceEpoch ? PartitionValue::DateMode::kDaysSinceEpoch
+                                    : PartitionValue::DateMode::kIsoString);
+  return applyFilter(*filter, value);
 }
 
 template <TypeKind kind>

@@ -5,19 +5,16 @@ Conversion Functions
 .. spark:function:: cast(value AS type) -> type
 
     Explicitly cast a ``value`` to a specified ``type``.
-    For cast pairs with Velox Spark ANSI support, behavior follows Spark ANSI
-    mode. Currently, ANSI mode is supported for casting from string to boolean,
-    integral, and date types. Other cast pairs follow the behavior used when
-    Spark ANSI mode is disabled:
 
-    * If the ``value`` exceeds the range of the ``type``, no error is raised.
-      Instead, the ``value`` is "wrapped" around.
+    Behavior depends on the source and target types. Unless otherwise noted
+    below, examples reflect behavior when Spark ANSI mode is disabled.
+
+    * If the ``value`` exceeds the range of the ``type``, behavior is
+      type-dependent and documented in the corresponding section below.
 
     * If the ``value`` has an invalid format or contains characters incompatible
-      with the target ``type``, the cast function returns NULL. ::
-
-        SELECT cast(128 as tinyint); -- -128
-        SELECT cast('2012-Oct-23' as date); -- NULL
+      with the target ``type``, the result is type-dependent and documented in
+      the corresponding section below.
 
 .. spark:function:: try_cast(value AS type) -> type
 
@@ -398,6 +395,72 @@ Invalid examples
   SELECT cast(cast(100 as integer) as decimal(17, 16)); -- NULL (ANSI OFF) / ERROR (ANSI ON) // Value too large
   SELECT cast(cast(-100 as bigint) as decimal(17, 16)); -- NULL (ANSI OFF) / ERROR (ANSI ON) // Value too large
 
+From decimal types
+^^^^^^^^^^^^^^^^^
+
+*(ANSI compliant)*
+
+Casting a decimal value to a decimal of a different precision and scale is
+allowed.
+
+When ANSI mode is enabled, casting a value that overflows the target precision
+and scale throws an error. Otherwise, such casts return NULL.
+
+Valid examples
+
+::
+
+  SELECT cast(cast(-0.03 as decimal(2, 2)) as decimal(4, 4)); -- -0.0300
+  SELECT cast(cast(1.05 as decimal(20, 2)) as decimal(10, 5)); -- 1.05000
+  SELECT cast(cast(55.00 as decimal(6, 2)) as decimal(20, 10)); -- 55.0000000000
+  SELECT cast(cast(1.2345 as decimal(6, 4)) as decimal(20, 1)); -- 1.2
+
+Invalid examples
+
+::
+
+  SELECT cast(cast(-1000.000 as decimal(20, 3)) as decimal(6, 4)); -- NULL (ANSI OFF) / ERROR (ANSI ON) // Value too large
+  SELECT cast(cast(99999999999999999999999999999999999999 as decimal(38, 0)) as decimal(38, 1)); -- NULL (ANSI OFF) / ERROR (ANSI ON) // Value too large
+  SELECT cast(cast(-99999999999999999999999999999999999999 as decimal(38, 0)) as decimal(38, 1)); -- NULL (ANSI OFF) / ERROR (ANSI ON) // Value too large
+
+From floating-point types
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+*(ANSI compliant)*
+
+Casting a floating-point value to a decimal of given precision and scale is
+allowed. Supported types are real and double.
+
+When ANSI mode is enabled, casting a value that overflows the target precision
+and scale or is not finite throws an error. Otherwise, such casts return NULL.
+
+.. note::
+
+    For non-finite inputs (NaN, Infinity, and -Infinity), this is not aligned
+    with Spark, which returns NULL even in ANSI mode. Since a decimal cannot
+    represent these values, throwing in ANSI mode follows ANSI semantics and is
+    consistent with how Velox handles overflow in this cast. Spark's NULL comes
+    from catching an internal error before its ANSI check, which we treat as an
+    implementation artifact.
+
+Valid examples
+
+::
+
+  SELECT cast(cast(99999.99 as double) as decimal(10, 4)); -- 99999.9900
+  SELECT cast(cast(-1.0 as double) as decimal(10, 4)); -- -1.0000
+  SELECT cast(cast(10.03 as real) as decimal(10, 4)); -- 10.0300
+  SELECT cast(cast(0.0 as real) as decimal(10, 4)); -- 0.0000
+
+Invalid examples
+
+::
+
+  SELECT cast(cast(1e22 as double) as decimal(10, 2)); -- NULL (ANSI OFF) / ERROR (ANSI ON) // Result overflows
+  SELECT cast(cast(1e38 as double) as decimal(20, 2)); -- NULL (ANSI OFF) / ERROR (ANSI ON) // Result overflows
+  SELECT cast(cast('inf' as double) as decimal(38, 2)); -- NULL (ANSI OFF) / ERROR (ANSI ON) // Value is not finite
+  SELECT cast(cast('nan' as double) as decimal(38, 2)); -- NULL (ANSI OFF) / ERROR (ANSI ON) // Value is not finite
+
 Cast to Varbinary
 -----------------
 
@@ -455,6 +518,35 @@ Valid examples
   SELECT cast(cast('inf' as double) as timestamp); -- NULL
   SELECT cast(cast('nan' as double) as timestamp); -- NULL
 
+From strings
+^^^^^^^^^^^^
+
+*(ANSI compliant)*
+
+Casting from strings to timestamp uses Spark-compatible timestamp parsing.
+The parser accepts date-only values, both ``' '`` and ``'T'`` as date-time
+separators, fractional seconds, and leading or trailing spaces.
+
+Casting from invalid strings returns NULL when ANSI mode is disabled and throws
+an error when ANSI mode is enabled.
+
+Valid examples
+
+::
+
+  SELECT cast('1970-01-01' as timestamp); -- 1970-01-01 00:00:00
+  SELECT cast('2000-01-01 12:21:56' as timestamp); -- 2000-01-01 12:21:56
+  SELECT cast('2000-01-01T12:21:56' as timestamp); -- 2000-01-01 12:21:56
+  SELECT cast(' 2000-01-01 12:21:56 ' as timestamp); -- 2000-01-01 12:21:56
+  SELECT cast('2015-03-18 12:03:17.123' as timestamp); -- 2015-03-18 12:03:17.123
+
+Invalid examples
+
+::
+
+  SELECT cast('INVALID' as timestamp); -- NULL (ANSI OFF) / ERROR (ANSI ON)
+  SELECT cast('2012-Oct-01' as timestamp); -- NULL (ANSI OFF) / ERROR (ANSI ON)
+
 From boolean
 ^^^^^^^^^^^^
 
@@ -504,3 +596,23 @@ Valid examples
   -- 2020-01-01 00:00:00 UTC in America/Los_Angeles is local 2019-12-31 16:00:00.
   -- TIMESTAMP_UTC stores that local time as epoch 1577808000.
   SELECT cast(timestamp '2020-01-01 00:00:00' as timestamp_ntz); -- 2019-12-31 16:00:00
+
+From VARCHAR
+^^^^^^^^^^^^
+
+Casting a string to timestamp_utc parses the input as a local timestamp,
+not subject to session timezone adjustment.
+Any timezone suffix in the string is accepted but ignored — only the
+parsed timestamp is stored.
+Leading and trailing whitespace is stripped before parsing.
+
+Valid examples
+
+::
+
+  SELECT cast('1970-01-01' as timestamp_ntz); -- 1970-01-01 00:00:00
+  SELECT cast('2000-01-01 12:21:56' as timestamp_ntz); -- 2000-01-01 12:21:56
+  SELECT cast('2015-03-18T12:03:17' as timestamp_ntz); -- 2015-03-18 12:03:17
+  SELECT cast('2015-03-18 12:03:17.123' as timestamp_ntz); -- 2015-03-18 12:03:17.123
+  SELECT cast('1970-01-01 00:00:00-08:00' as timestamp_ntz); -- 1970-01-01 00:00:00
+  SELECT cast('2015-03-18T12:03:17Z' as timestamp_ntz); -- 2015-03-18 12:03:17
