@@ -367,8 +367,7 @@ void CudfSplitReader::setupCudfDataSource() {
     VLOG(1) << fmt::format(
         "Using KvikIO data source for file: {}", split_->filePath);
     dataSource_ = std::move(
-        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
-            .front());
+        cudf::io::make_datasources(split_->getCudfSourceInfo()).front());
     return;
   }
 
@@ -397,8 +396,7 @@ void CudfSplitReader::setupCudfDataSource() {
         "Failed to generate file handle cache for file. Falling back to KvikIO. Path: {}",
         split_->filePath);
     dataSource_ = std::move(
-        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
-            .front());
+        cudf::io::make_datasources(split_->getCudfSourceInfo()).front());
     return;
   }
 
@@ -431,8 +429,7 @@ void CudfSplitReader::setupCudfDataSource() {
         "Failed to create buffered input data source for file. Falling back to the KvikIO. Path: {}",
         split_->filePath);
     dataSource_ = std::move(
-        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
-            .front());
+        cudf::io::make_datasources(split_->getCudfSourceInfo()).front());
     return;
   }
   dataSource_ =

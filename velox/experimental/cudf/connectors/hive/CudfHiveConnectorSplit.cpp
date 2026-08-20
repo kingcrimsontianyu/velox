@@ -19,8 +19,12 @@
 
 #include <cudf/io/types.hpp>
 
+#include <folly/Conv.h>
+
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -31,6 +35,26 @@ std::string stripFilePrefix(const std::string& targetPath) {
     return targetPath.substr(prefix.length());
   }
   return targetPath;
+}
+
+// Builds a cuDF source_info for 'path', threading through a known file size
+// when one is available (via the synthesized "$file_size" info column, e.g.
+// populated from the Presto coordinator's S3 LIST). This lets
+// remote_file_source skip its blocking HEAD request to query the file size.
+std::unique_ptr<cudf::io::source_info> makeCudfSourceInfo(
+    const std::string& path,
+    const std::unordered_map<std::string, std::string>& infoColumns) {
+  std::optional<std::size_t> knownSize;
+  if (auto it = infoColumns.find("$file_size"); it != infoColumns.end()) {
+    try {
+      knownSize = folly::to<std::size_t>(it->second);
+    } catch (const std::exception&) {
+      // Fall back to no size hint if the value can't be parsed.
+    }
+  }
+  return std::make_unique<cudf::io::source_info>(
+      std::vector<cudf::io::filepath_source>{
+          cudf::io::filepath_source{path, knownSize}});
 }
 } // namespace
 
@@ -58,7 +82,7 @@ CudfHiveConnectorSplit::CudfHiveConnectorSplit(
       filePath(stripFilePrefix(_filePath)),
       start(_start),
       length(_length),
-      cudfSourceInfo(std::make_unique<cudf::io::source_info>(filePath)),
+      cudfSourceInfo(makeCudfSourceInfo(filePath, _infoColumns)),
       infoColumns(_infoColumns) {}
 
 // static
