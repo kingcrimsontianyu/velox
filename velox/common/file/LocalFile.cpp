@@ -243,6 +243,28 @@ uint64_t LocalReadFile::preadv(
   iovecs.reserve(buffers.size());
 
   auto readvFunc = [&]() -> ssize_t {
+    if (directIo_) {                                   // only meaningful under O_DIRECT
+        const auto a = readAlignment_;
+        bool bad = (offset % a) != 0;
+        for (const auto& v : iovecs) {
+        if ((reinterpret_cast<uintptr_t>(v.iov_base) % a) || (v.iov_len % a)) {
+            bad = true;
+        }
+        }
+        if (bad) {
+        LOG(ERROR) << "[ODIRECT-DBG] pre-preadv unaligned: align=" << a
+                    << " offset=" << offset << " off%a=" << (offset % a)
+                    << " niov=" << iovecs.size();
+        for (size_t i = 0; i < iovecs.size(); ++i) {
+            LOG(ERROR) << "[ODIRECT-DBG]  iov[" << i << "] base=" << iovecs[i].iov_base
+                    << " base%a=" << (reinterpret_cast<uintptr_t>(iovecs[i].iov_base) % a)
+                    << " len=" << iovecs[i].iov_len
+                    << " len%a=" << (iovecs[i].iov_len % a)
+                    << (iovecs[i].iov_base == droppedBytes.data() ? " [GAP]" : "");
+        }
+        }
+    }
+
     const auto bytesRead =
         folly::preadv(fd_, iovecs.data(), iovecs.size(), offset);
     if (bytesRead < 0) {
