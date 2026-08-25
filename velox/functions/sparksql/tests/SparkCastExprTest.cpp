@@ -189,14 +189,12 @@ class SparkCastExprTest : public functions::test::CastBaseTest {
             0.0,
             1727181032.0,
             -1727181032.0,
-            std::numeric_limits<float>::max(),
             std::numeric_limits<float>::min(),
         }),
         makeNullableFlatVector<Timestamp>({
             Timestamp(0, 0),
             Timestamp(1727181056, 0),
             Timestamp(-1727181056, 0),
-            Timestamp(9223372036854, 775'807'000),
             Timestamp(0, 0),
         }));
   }
@@ -207,22 +205,12 @@ class SparkCastExprTest : public functions::test::CastBaseTest {
             0.0,
             1727181032.0,
             -1727181032.0,
-            9223372036855.999,
-            -9223372036856.999,
-            1.79769e+308,
-            std::numeric_limits<double>::max(),
-            -std::numeric_limits<double>::max(),
             std::numeric_limits<double>::min(),
         }),
         makeNullableFlatVector<Timestamp>({
             Timestamp(0, 0),
             Timestamp(1727181032, 0),
             Timestamp(-1727181032, 0),
-            Timestamp(9223372036854, 775'807'000),
-            Timestamp(-9223372036855, 224'192'000),
-            Timestamp(9223372036854, 775'807'000),
-            Timestamp(9223372036854, 775'807'000),
-            Timestamp(-9223372036855, 224'192'000),
             Timestamp(0, 0),
         }));
   }
@@ -1297,6 +1285,34 @@ class SparkCastExprTest : public functions::test::CastBaseTest {
             DECIMAL(20, 10)));
   }
 
+  // Valid bool-to-decimal cases. Results are identical regardless of ANSI
+  // mode, so they are shared between the ANSI ON and ANSI OFF tests.
+  void testBoolToDecimal() {
+    auto input =
+        makeFlatVector<bool>({true, false, false, true, true, true, false});
+    // Bool to short decimal.
+    testCast(
+        input,
+        makeFlatVector<int64_t>({100, 0, 0, 100, 100, 100, 0}, DECIMAL(6, 2)));
+
+    // Bool to long decimal.
+    testCast(
+        input,
+        makeFlatVector<int128_t>(
+            {10'000'000'000,
+             0,
+             0,
+             10'000'000'000,
+             10'000'000'000,
+             10'000'000'000,
+             0},
+            DECIMAL(20, 10)));
+
+    // False becomes zero, which fits any precision and scale.
+    testCast<bool, int64_t>(BOOLEAN(), DECIMAL(1, 1), {false}, {0});
+    testCast<bool, int128_t>(BOOLEAN(), DECIMAL(38, 38), {false}, {0});
+  }
+
   void testDecimalToDecimal() {
     // Short to short, scale up.
     auto shortFlat =
@@ -1619,10 +1635,74 @@ TEST_F(SparkCastExprTestAnsiOn, decimalToIntegral) {
 
 TEST_F(SparkCastExprTestAnsiOn, floatToTimestamp) {
   testFloatToTimestamp();
+
+  auto overflowInput = makeRowVector({makeFlatVector<float>({
+      std::numeric_limits<float>::max(),
+  })});
+  VELOX_ASSERT_THROW(
+      evaluate("cast(c0 as timestamp)", overflowInput), "Cannot cast");
+
+  auto nonFiniteInput = makeRowVector({makeFlatVector<float>({
+      kInf,
+      kNan,
+      -kInf,
+  })});
+  VELOX_ASSERT_THROW(
+      evaluate("cast(c0 as timestamp)", nonFiniteInput), "Cannot cast");
+
+  assertEqualVectors(
+      makeNullableFlatVector<Timestamp>({
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+      }),
+      evaluate("try_cast(c0 as timestamp)", nonFiniteInput));
+
+  assertEqualVectors(
+      makeNullableFlatVector<Timestamp>({
+          std::nullopt,
+      }),
+      evaluate("try_cast(c0 as timestamp)", overflowInput));
 }
 
 TEST_F(SparkCastExprTestAnsiOn, doubleToTimestamp) {
   testDoubleToTimestamp();
+
+  auto overflowInput = makeRowVector({makeFlatVector<double>({
+      9223372036855.999,
+      -9223372036856.999,
+      1.79769e+308,
+      std::numeric_limits<double>::max(),
+      -std::numeric_limits<double>::max(),
+  })});
+  VELOX_ASSERT_THROW(
+      evaluate("cast(c0 as timestamp)", overflowInput), "Cannot cast");
+
+  auto nonFiniteInput = makeRowVector({makeFlatVector<double>({
+      kInf,
+      kNan,
+      -kInf,
+  })});
+  VELOX_ASSERT_THROW(
+      evaluate("cast(c0 as timestamp)", nonFiniteInput), "Cannot cast");
+
+  assertEqualVectors(
+      makeNullableFlatVector<Timestamp>({
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+      }),
+      evaluate("try_cast(c0 as timestamp)", nonFiniteInput));
+
+  assertEqualVectors(
+      makeNullableFlatVector<Timestamp>({
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+      }),
+      evaluate("try_cast(c0 as timestamp)", overflowInput));
 }
 
 TEST_F(SparkCastExprTestAnsiOn, timestampToInt) {
@@ -1773,6 +1853,31 @@ TEST_F(SparkCastExprTestAnsiOn, stringToDate) {
   testInvalidDate("2015/03/18");
   testInvalidDate("2015-13-01");
   testInvalidDate("2015-02-30");
+}
+
+TEST_F(SparkCastExprTestAnsiOn, stringToTime) {
+  auto validInput = makeRowVector({makeFlatVector<std::string>(
+      {"12:03:17.123456", " 12:30:45 ", "12:30"})});
+  auto validResult = evaluateCast(VARCHAR(), TIME_MICRO_UTC(), validInput);
+  ASSERT_TRUE(validResult->type()->equivalent(*TIME_MICRO_UTC()));
+  assertEqualVectors(
+      makeFlatVector<int64_t>(
+          {43'397'123'456LL, 45'045'000'000LL, 45'000'000'000LL},
+          TIME_MICRO_UTC()),
+      validResult);
+
+  auto testInvalidString = [this](const std::string& value) {
+    auto input = makeRowVector({makeFlatVector<std::string>({value})});
+    VELOX_ASSERT_THROW(
+        evaluateCast(VARCHAR(), TIME_MICRO_UTC(), input), "Cannot cast");
+  };
+
+  testInvalidString("24:00:00");
+  testInvalidString("12:60:00");
+  testInvalidString("12:30:60");
+  testInvalidString("12:30:45.1234567");
+  testInvalidString("abc");
+  testInvalidString("");
 }
 
 TEST_F(SparkCastExprTestAnsiOn, fromString) {
@@ -1934,28 +2039,48 @@ TEST_F(SparkCastExprTestAnsiOff, decimalToString) {
 
 TEST_F(SparkCastExprTestAnsiOff, floatToTimestamp) {
   testFloatToTimestamp();
-  testCast(
-      makeFlatVector<float>({kInf, kNan, -kInf}),
-      makeNullableFlatVector<Timestamp>({
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-      }));
-}
 
-TEST_F(SparkCastExprTestAnsiOff, doubleToTimestamp) {
-  testDoubleToTimestamp();
   testCast(
-      makeFlatVector<double>({
+      makeFlatVector<float>({
+          std::numeric_limits<float>::max(),
           kInf,
           kNan,
           -kInf,
       }),
       makeNullableFlatVector<Timestamp>({
+          Timestamp(9223372036854, 775'807'000),
           std::nullopt,
           std::nullopt,
           std::nullopt,
-      }));
+      }),
+      false);
+}
+
+TEST_F(SparkCastExprTestAnsiOff, doubleToTimestamp) {
+  testDoubleToTimestamp();
+
+  testCast(
+      makeFlatVector<double>({
+          9223372036855.999,
+          -9223372036856.999,
+          1.79769e+308,
+          std::numeric_limits<double>::max(),
+          -std::numeric_limits<double>::max(),
+          kInf,
+          kNan,
+          -kInf,
+      }),
+      makeNullableFlatVector<Timestamp>({
+          Timestamp(9223372036854, 775'807'000),
+          Timestamp(-9223372036855, 224'192'000),
+          Timestamp(9223372036854, 775'807'000),
+          Timestamp(9223372036854, 775'807'000),
+          Timestamp(-9223372036855, 224'192'000),
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+      }),
+      false);
 }
 
 TEST_F(SparkCastExprTestAnsiOff, timestampToInt) {
@@ -2063,6 +2188,36 @@ TEST_F(SparkCastExprTestAnsiOff, stringToDate) {
       {std::nullopt, std::nullopt, std::nullopt, std::nullopt},
       VARCHAR(),
       DATE());
+}
+
+TEST_F(SparkCastExprTestAnsiOff, stringToTime) {
+  testCast<std::string, int64_t>(
+      VARCHAR(),
+      TIME_MICRO_UTC(),
+      {"00:00:00",
+       "01:30:00",
+       "12:03:17.123",
+       "12:03:17.123456",
+       " 12:30:45 ",
+       "24:00:00",
+       "12:60:00",
+       "12:30:60",
+       "12:30",
+       "12:30:45.1234567",
+       "abc",
+       ""},
+      {0LL,
+       5'400'000'000LL,
+       43'397'123'000LL,
+       43'397'123'456LL,
+       45'045'000'000LL,
+       std::nullopt,
+       std::nullopt,
+       std::nullopt,
+       45'000'000'000LL,
+       std::nullopt,
+       std::nullopt,
+       std::nullopt});
 }
 
 TEST_F(SparkCastExprTestAnsiOff, fromString) {
@@ -2536,6 +2691,24 @@ TEST_F(SparkCastExprTestAnsiOn, decimalToDecimal) {
   testOverflowThrow();
 }
 
+TEST_F(SparkCastExprTestAnsiOn, boolToDecimal) {
+  // Regular cases produce the same results regardless of ANSI mode.
+  testBoolToDecimal();
+
+  // Under ANSI ON, true overflows a target with no integer digits
+  // (precision == scale), because 1 cannot be represented there.
+  testThrow<bool>(
+      BOOLEAN(),
+      DECIMAL(1, 1),
+      {true},
+      "Cannot cast BOOLEAN 'true' to DECIMAL(1, 1)");
+  testThrow<bool>(
+      BOOLEAN(),
+      DECIMAL(38, 38),
+      {true},
+      "Cannot cast BOOLEAN 'true' to DECIMAL(38, 38)");
+}
+
 TEST_F(SparkCastExprTestAnsiOn, doubleToDecimal) {
   // Regular cases produce the same results regardless of ANSI mode.
   testDoubleToDecimal();
@@ -2788,6 +2961,16 @@ TEST_F(SparkCastExprTestAnsiOff, integralToDecimal) {
   testOverflowNull.operator()<int64_t>();
 }
 
+TEST_F(SparkCastExprTestAnsiOff, boolToDecimal) {
+  // Regular cases produce the same results regardless of ANSI mode.
+  testBoolToDecimal();
+
+  // Under ANSI OFF, the same overflowing inputs return NULL instead of
+  // throwing.
+  testCast<bool, int64_t>(BOOLEAN(), DECIMAL(1, 1), {true}, {std::nullopt});
+  testCast<bool, int128_t>(BOOLEAN(), DECIMAL(38, 38), {true}, {std::nullopt});
+}
+
 TEST_F(SparkCastExprTestAnsiOff, doubleToDecimal) {
   // Regular cases produce the same results regardless of ANSI mode.
   testDoubleToDecimal();
@@ -2833,5 +3016,105 @@ TEST_F(SparkCastExprTestAnsiOff, realToDecimal) {
   testCast<float, int128_t>(REAL(), DECIMAL(38, 2), {NAN}, {std::nullopt});
 }
 
+TEST_F(SparkCastExprTestAnsiOn, castNumericToIntegralOverflow) {
+  // Casts that overflow the target integral type throw under ANSI mode.
+  testThrow<int32_t>(
+      INTEGER(), TINYINT(), {256}, "Cannot cast INTEGER '256' to TINYINT");
+  testThrow<int64_t>(
+      BIGINT(),
+      SMALLINT(),
+      {100000},
+      "Cannot cast BIGINT '100000' to SMALLINT");
+  testThrow<double>(DOUBLE(), INTEGER(), {3.0e10}, "Cannot cast DOUBLE");
+  testThrow<double>(DOUBLE(), BIGINT(), {1.0e20}, "Cannot cast DOUBLE");
+  testThrow<int32_t>(
+      INTEGER(), TINYINT(), {-200}, "Cannot cast INTEGER '-200' to TINYINT");
+  testThrow<int64_t>(
+      BIGINT(),
+      SMALLINT(),
+      {-50000},
+      "Cannot cast BIGINT '-50000' to SMALLINT");
+
+  // In-range values still cast successfully under ANSI mode.
+  testCast<int32_t, int8_t>("tinyint", {127}, {127});
+  testCast<int32_t, int8_t>("tinyint", {-128}, {-128});
+}
+
+TEST_F(SparkCastExprTestAnsiOn, castFloatToIntegralNaN) {
+  // NaN cannot be cast to an integral value under ANSI mode.
+  testThrow<float>(
+      REAL(),
+      INTEGER(),
+      {std::numeric_limits<float>::quiet_NaN()},
+      "Cannot cast NaN to an integral value");
+  testThrow<double>(
+      DOUBLE(),
+      BIGINT(),
+      {std::numeric_limits<double>::quiet_NaN()},
+      "Cannot cast NaN to an integral value");
+}
+
+TEST_F(SparkCastExprTestAnsiOn, castFloatToIntegralInfinity) {
+  // Infinity overflows the target integral type under ANSI mode.
+  testThrow<double>(
+      DOUBLE(),
+      INTEGER(),
+      {std::numeric_limits<double>::infinity()},
+      "Cannot cast DOUBLE");
+  testThrow<double>(
+      DOUBLE(),
+      INTEGER(),
+      {-std::numeric_limits<double>::infinity()},
+      "Cannot cast DOUBLE");
+}
+
+TEST_F(SparkCastExprTestAnsiOn, tryCastNumericToIntegralOverflow) {
+  // try_cast returns null on overflow regardless of the ANSI mode setting.
+  testTryCast<int32_t, int8_t>("tinyint", {256}, {std::nullopt});
+  testTryCast<float, int32_t>("integer", {3.0e10f}, {std::nullopt});
+}
+
+TEST_F(SparkCastExprTestAnsiOff, castNumericToIntegralOverflow) {
+  // Casts that overflow the target integral type wrap or saturate when ANSI
+  // mode is disabled.
+  testCast<int32_t, int8_t>("tinyint", {256}, {static_cast<int8_t>(256)});
+  testCast<int64_t, int16_t>(
+      "smallint", {100000}, {static_cast<int16_t>(100000)});
+  testCast<double, int32_t>(
+      "integer", {3.0e10}, {std::numeric_limits<int32_t>::max()});
+}
+
+TEST_F(SparkCastExprTestAnsiOff, tryCastFloatToIntegralSaturation) {
+  // Spark try_cast for float/double to integral saturates when the value
+  // equals the target type's limit after floating-point rounding, and returns
+  // null when the value clearly exceeds the target type's range.
+
+  // Values at the double-rounded limit saturate to min/max.
+  testTryCast<float, int64_t>(
+      "bigint", {9.223372E18f}, {std::numeric_limits<int64_t>::max()});
+  testTryCast<float, int64_t>(
+      "bigint", {-9.223372E18f}, {std::numeric_limits<int64_t>::min()});
+  testTryCast<double, int64_t>(
+      "bigint", {9.223372036854776E18}, {std::numeric_limits<int64_t>::max()});
+  testTryCast<double, int64_t>(
+      "bigint", {-9.223372036854776E18}, {std::numeric_limits<int64_t>::min()});
+  testTryCast<double, int32_t>(
+      "integer", {2147483647.9}, {std::numeric_limits<int32_t>::max()});
+  testTryCast<double, int32_t>(
+      "integer", {-2147483648.9}, {std::numeric_limits<int32_t>::min()});
+
+  // Values beyond the range return null.
+  testTryCast<double, int32_t>("integer", {3.0e10}, {std::nullopt});
+  testTryCast<float, int64_t>("bigint", {1.0e20f}, {std::nullopt});
+  testTryCast<float, int8_t>("tinyint", {3.0e9f}, {std::nullopt});
+  testTryCast<float, int16_t>("smallint", {1.0e6f}, {std::nullopt});
+  testTryCast<double, int8_t>("tinyint", {-200.0}, {std::nullopt});
+  testTryCast<float, int64_t>(
+      "bigint", {std::numeric_limits<float>::quiet_NaN()}, {std::nullopt});
+
+  // In-range values truncate toward zero.
+  testTryCast<float, int8_t>("tinyint", {100.5f}, {100});
+  testTryCast<double, int64_t>("bigint", {42.7}, {42});
+}
 } // namespace
 } // namespace facebook::velox::test
