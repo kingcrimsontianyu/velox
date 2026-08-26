@@ -38,6 +38,7 @@
 
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 
 #include <cuda.h>
 
@@ -318,6 +319,8 @@ void registerCudf() {
 
   CUDF_FUNC_RANGE();
   cudaFree(nullptr); // Initialize CUDA context at startup
+
+  cudf::config_default_pinned_memory_resource(cudf::pinned_mr_options{size_t{2} << 30});
 
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
   auto mr = cudf_velox::createMemoryResource(

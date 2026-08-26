@@ -25,6 +25,7 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/types.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda/iterator>
 #include <cuda/std/tuple>
@@ -67,9 +68,71 @@ std::future<T> toStdFuture(folly::Future<T> follyFuture) {
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
+class PinnedStagingBuffer {
+ public:
+  explicit PinnedStagingBuffer(size_t size)
+      : mr_(cudf::get_pinned_memory_resource()),
+        size_(size),
+        data_(static_cast<uint8_t*>(mr_.allocate_sync(size))) {}
+
+  ~PinnedStagingBuffer() {
+    mr_.deallocate_sync(data_, size_);
+  }
+
+  PinnedStagingBuffer(const PinnedStagingBuffer&) = delete;
+  PinnedStagingBuffer& operator=(const PinnedStagingBuffer&) = delete;
+
+  uint8_t* data() const {
+    return data_;
+  }
+
+ private:
+  rmm::host_device_async_resource_ref mr_;
+  size_t size_;
+  uint8_t* data_;
+};
+
+// One reusable pinned staging buffer per IO thread, plus the event marking its
+// last H2D copy.
+//
+// Deliberately holds raw pointers and declares no destructor, so it stays
+// trivially destructible and is simply abandoned at thread exit. Releasing
+// CUDA resources from a thread_local destructor is unsafe: it can run after
+// the CUDA context has been torn down.
+struct PinnedStagingSlot {
+  PinnedStagingBuffer* buffer{nullptr};
+  size_t capacity{0};
+  cudaEvent_t event{nullptr};
+
+  // Returns a buffer of at least 'size' bytes, first waiting for this slot's
+  // previous copy to land so the memory is safe to overwrite.
+  uint8_t* reserve(size_t size) {
+    if (event != nullptr) {
+      CUDF_CUDA_TRY(cudaEventSynchronize(event));
+    }
+    if (capacity < size) {
+      delete buffer;
+      buffer = new PinnedStagingBuffer(size);
+      capacity = size;
+    }
+    return buffer->data();
+  }
+
+  // Marks the position of the just-issued copy so the next reserve() can wait
+  // on that copy alone rather than on the whole stream.
+  void recordCopy(cudaStream_t stream) {
+    if (event == nullptr) {
+      CUDF_CUDA_TRY(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    }
+    CUDF_CUDA_TRY(cudaEventRecord(event, stream));
+  }
+};
+
 BufferedInputDataSource::BufferedInputDataSource(
     std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input)
     : input_(std::move(input)), fileSize_(input_->getReadFile()->size()) {}
+
+BufferedInputDataSource::~BufferedInputDataSource() = default;
 
 size_t BufferedInputDataSource::size() const {
   return fileSize_;
@@ -82,19 +145,39 @@ void BufferedInputDataSource::enqueueForDevice(
   auto inputStream = input_->enqueue({offset, size});
   std::shared_ptr sharedStream(std::move(inputStream));
   pendingDeviceLoads_.push_back(
-      [dst, size, sharedStream](rmm::cuda_stream_view stream) {
-        std::vector<uint8_t> buffer(size);
-        sharedStream->readFully(reinterpret_cast<char*>(buffer.data()), size);
+      [this, dst, size, sharedStream](rmm::cuda_stream_view stream) {
+        auto staging = std::make_unique<PinnedStagingBuffer>(size);
+        const void* chunk{nullptr};
+        int32_t chunkSize{0};
+        uint64_t done{0};
+        while (done < size) {
+          VELOX_CHECK(
+              sharedStream->Next(&chunk, &chunkSize),
+              "Unexpected end of stream after {} of {} bytes",
+              done,
+              size);
+          if (chunkSize <= 0) {
+            continue;
+          }
+          const auto copySize =
+              std::min<uint64_t>(static_cast<uint64_t>(chunkSize), size - done);
+          std::memcpy(staging->data() + done, chunk, copySize);
+          done += copySize;
+        }
         CUDF_CUDA_TRY(cudaMemcpyAsync(
-            dst, buffer.data(), size, cudaMemcpyDefault, stream.value()));
+            dst, staging->data(), size, cudaMemcpyDefault, stream.value()));
+        pendingStagingBuffers_.push_back(std::move(staging));
       });
 }
 
 void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {
   input_->load(velox::dwio::common::LogType::FILE);
-  std::lock_guard<std::mutex> lock(ioBatchMutex());
   for (auto& deviceLoad : pendingDeviceLoads_) {
     deviceLoad(stream);
+  }
+  if (!pendingStagingBuffers_.empty()) {
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+    pendingStagingBuffers_.clear();
   }
 }
 
@@ -143,14 +226,26 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
   VELOX_CHECK(input_->executor() != nullptr, "IO executor is not initialized");
   auto future = folly::via(input_->executor())
                     .thenValue([this, offset, size, dst, stream](auto&&) {
-                      auto hostBuffer = this->host_read(offset, size);
+                      if (offset >= fileSize_) {
+                        return size_t{0};
+                      }
+                      const size_t readSize =
+                          std::min(size, fileSize_ - offset);
+                      if (readSize == 0) {
+                        return size_t{0};
+                      }
+                      static thread_local PinnedStagingSlot slot;
+
+                      uint8_t* staging = slot.reserve(readSize);
+                      readContiguous(offset, readSize, staging);
                       CUDF_CUDA_TRY(cudaMemcpyAsync(
                           dst,
-                          hostBuffer->data(),
-                          hostBuffer->size(),
+                          staging,
+                          readSize,
                           cudaMemcpyDefault,
                           stream.value()));
-                      return hostBuffer->size();
+                      slot.recordCopy(stream.value());
+                      return readSize;
                     });
   return toStdFuture(std::move(future));
 }

@@ -35,6 +35,8 @@
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
+class PinnedStagingBuffer;
+
 // ---------------- Internal helper ----------------
 // A cudf::io::datasource that serves bytes via Velox BufferedInput so that
 // reads benefit from AsyncDataCache / SSD cache and are always returned as
@@ -43,6 +45,8 @@ class BufferedInputDataSource : public cudf::io::datasource {
  public:
   explicit BufferedInputDataSource(
       std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input);
+
+  ~BufferedInputDataSource() override;
 
   [[nodiscard]] size_t size() const override;
 
@@ -79,6 +83,7 @@ class BufferedInputDataSource : public cudf::io::datasource {
   const size_t fileSize_;
   std::vector<std::function<void(rmm::cuda_stream_view stream)>>
       pendingDeviceLoads_;
+  std::vector<std::unique_ptr<PinnedStagingBuffer>> pendingStagingBuffers_;
 };
 
 /**
