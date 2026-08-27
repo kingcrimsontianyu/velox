@@ -80,6 +80,14 @@ class ScopedNvtxRange {
   ScopedNvtxRange& operator=(const ScopedNvtxRange&) = delete;
 };
 
+std::unique_ptr<cudf::io::datasource> makeKvikioDataSource(
+    std::string_view path) {
+  auto sources = cudf::io::make_datasources(
+      cudf::io::source_info{normalizeKvikioUri(path)});
+  VELOX_CHECK_EQ(sources.size(), 1);
+  return std::move(sources.front());
+}
+
 // Rebuilds a struct/list column in-place after possibly transforming (e.g.,
 // decimal-casting) its children.
 template <typename TransformChildrenFn>
@@ -404,9 +412,7 @@ void CudfSplitReader::setupCudfDataSource() {
   if (not useBufferedInput) {
     VLOG(1) << fmt::format(
         "Using KvikIO data source for file: {}", split_->filePath);
-    dataSource_ = std::move(
-        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
-            .front());
+    dataSource_ = makeKvikioDataSource(split_->filePath);
     return;
   }
 
@@ -434,9 +440,7 @@ void CudfSplitReader::setupCudfDataSource() {
     LOG(WARNING) << fmt::format(
         "Failed to generate file handle cache for file. Falling back to KvikIO. Path: {}",
         split_->filePath);
-    dataSource_ = std::move(
-        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
-            .front());
+    dataSource_ = makeKvikioDataSource(split_->filePath);
     return;
   }
 
@@ -468,9 +472,7 @@ void CudfSplitReader::setupCudfDataSource() {
     LOG(WARNING) << fmt::format(
         "Failed to create buffered input data source for file. Falling back to the KvikIO. Path: {}",
         split_->filePath);
-    dataSource_ = std::move(
-        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
-            .front());
+    dataSource_ = makeKvikioDataSource(split_->filePath);
     return;
   }
   dataSource_ =
