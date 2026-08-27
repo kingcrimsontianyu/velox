@@ -66,6 +66,20 @@ bool isAbfsPath([[maybe_unused]] const std::string_view path) {
 #endif
 }
 
+class ScopedNvtxRange {
+ public:
+  explicit ScopedNvtxRange(const char* name) {
+    nvtxRangePush(name);
+  }
+
+  ~ScopedNvtxRange() {
+    nvtxRangePop();
+  }
+
+  ScopedNvtxRange(const ScopedNvtxRange&) = delete;
+  ScopedNvtxRange& operator=(const ScopedNvtxRange&) = delete;
+};
+
 // Rebuilds a struct/list column in-place after possibly transforming (e.g.,
 // decimal-casting) its children.
 template <typename TransformChildrenFn>

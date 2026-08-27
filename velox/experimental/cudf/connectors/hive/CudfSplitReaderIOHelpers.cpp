@@ -21,9 +21,51 @@
 
 #include <algorithm>
 #include <functional>
+#include <future>
 #include <iterator>
 #include <utility>
 #include <vector>
+
+namespace {
+
+// Keeps the datasource alive while cuDF drains its completion future. The
+// explicit destructor is important when the outer deferred future is discarded:
+// lambda-capture destruction order alone cannot provide this lifetime rule.
+class RetainedReadCompletion {
+ public:
+  RetainedReadCompletion(
+      std::shared_ptr<cudf::io::datasource> dataSource,
+      std::future<void> completion)
+      : dataSource_(std::move(dataSource)),
+        completion_(std::move(completion)) {}
+
+  RetainedReadCompletion(RetainedReadCompletion&& other) noexcept
+      : dataSource_(std::move(other.dataSource_)),
+        completion_(std::move(other.completion_)) {}
+
+  RetainedReadCompletion(const RetainedReadCompletion&) = delete;
+  RetainedReadCompletion& operator=(const RetainedReadCompletion&) = delete;
+  RetainedReadCompletion& operator=(RetainedReadCompletion&&) = delete;
+
+  ~RetainedReadCompletion() noexcept {
+    if (completion_.valid()) {
+      try {
+        completion_.get();
+      } catch (...) {
+      }
+    }
+  }
+
+  void get() {
+    completion_.get();
+  }
+
+ private:
+  std::shared_ptr<cudf::io::datasource> dataSource_;
+  std::future<void> completion_;
+};
+
+} // namespace
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -70,10 +112,17 @@ ByteRangeFetch fetchByteRangesAsync(
   auto [buffers, data, pending] =
       cudf::io::parquet::fetch_byte_ranges_to_device_async(
           *dataSource, {byteRanges.data(), byteRanges.size()}, stream, mr);
+  auto completionState =
+      RetainedReadCompletion{std::move(dataSource), std::move(pending)};
+  auto retainedCompletion = std::async(
+      std::launch::deferred,
+      [completionState = std::move(completionState)]() mutable {
+        completionState.get();
+      });
   return {
       .buffers = std::move(buffers),
       .data = std::move(data),
-      .pending = std::move(pending)};
+      .pending = std::move(retainedCompletion)};
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive

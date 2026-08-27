@@ -19,9 +19,12 @@
 
 #include "velox/common/base/Exceptions.h"
 
+#include <rmm/cuda_device.hpp>
+
 #include <folly/Executor.h>
 
 #include <algorithm>
+#include <exception>
 #include <functional>
 #include <future>
 #include <memory>
@@ -33,22 +36,32 @@ namespace facebook::velox::cudf_velox::connector::hive {
 
 namespace {
 
-// Launches the `read` task on the IO executor or waiting thread, whichever
-// starts first.
-std::future<size_t> submitDeviceRead(
-    folly::Executor* executor,
-    std::function<size_t()> read) {
-  auto task = std::make_shared<std::packaged_task<size_t()>>(std::move(read));
-  auto result = task->get_future();
-  auto once = std::make_shared<std::once_flag>();
-  auto run = [once, task]() { std::call_once(*once, [task]() { (*task)(); }); };
-  executor->add(run);
-  return std::async(
-      std::launch::deferred,
-      [run = std::move(run), result = std::move(result)]() mutable {
-        run();
-        return result.get();
-      });
+int getStreamDevice(rmm::cuda_stream_view stream) {
+  int device{};
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+  CUDF_CUDA_TRY(cudaStreamGetDevice(stream.value(), &device));
+#else
+  // CUDA versions before 12.8 cannot query a stream's device. Retain the
+  // historical requirement that the stream belongs to the current device.
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+#endif
+  return device;
+}
+
+void synchronizeStream(rmm::cuda_stream_view stream, int device) {
+  auto const deviceScope =
+      rmm::cuda_set_device_raii{rmm::cuda_device_id{device}};
+  try {
+    stream.synchronize();
+  } catch (...) {
+    const auto primaryError = std::current_exception();
+    // Returning while a host buffer may still be in use would be unsafe. A
+    // device-wide fence is the last recoverable fallback.
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+      std::terminate();
+    }
+    std::rethrow_exception(primaryError);
+  }
 }
 
 } // namespace
@@ -104,17 +117,46 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
     uint8_t* dst,
     rmm::cuda_stream_view stream) {
   VELOX_CHECK(input_->executor() != nullptr, "IO executor is not initialized");
-  return submitDeviceRead(
-      input_->executor(), [this, offset, size, dst, stream]() {
-        auto hostBuffer = host_read(offset, size);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(
-            dst,
-            hostBuffer->data(),
-            hostBuffer->size(),
-            cudaMemcpyDefault,
-            stream.value()));
-        return hostBuffer->size();
-      });
+  const auto device = getStreamDevice(stream);
+  auto promise = std::make_shared<std::promise<size_t>>();
+  auto future = promise->get_future();
+  try {
+    input_->executor()->add(
+        [this, offset, size, dst, stream, device, promise]() {
+          try {
+            auto const deviceScope =
+                rmm::cuda_set_device_raii{rmm::cuda_device_id{device}};
+            auto hostBuffer = this->host_read(offset, size);
+            if (hostBuffer->size() != 0) {
+              try {
+                CUDF_CUDA_TRY(cudaMemcpyAsync(
+                    dst,
+                    hostBuffer->data(),
+                    hostBuffer->size(),
+                    cudaMemcpyHostToDevice,
+                    stream.value()));
+              } catch (...) {
+                auto const copyError = std::current_exception();
+                try {
+                  synchronizeStream(stream, device);
+                } catch (...) {
+                  // synchronizeStream either establishes completion before it
+                  // throws or terminates when completion cannot be proven.
+                }
+                std::rethrow_exception(copyError);
+              }
+              synchronizeStream(stream, device);
+            }
+            promise->set_value(hostBuffer->size());
+          } catch (...) {
+            promise->set_exception(std::current_exception());
+          }
+        });
+  } catch (...) {
+    // Executor rejection is synchronous and no task owns the destination.
+    promise->set_exception(std::current_exception());
+  }
+  return future;
 }
 
 bool BufferedInputDataSource::supports_device_read() const {
