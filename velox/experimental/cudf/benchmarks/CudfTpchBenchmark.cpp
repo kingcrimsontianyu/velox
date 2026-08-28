@@ -55,6 +55,10 @@ DEFINE_int32(
     "Preferred output batch size in rows for cudf operators.");
 
 DEFINE_bool(velox_cudf_table_scan, true, "Enable cuDF table scan");
+DEFINE_bool(
+    cudf_hive_use_buffered_input,
+    true,
+    "Use BufferedInputDataSource instead of KvikIO for cuDF Hive reads");
 
 DEFINE_string(
     cudf_properties,
@@ -85,6 +89,9 @@ void CudfTpchBenchmark::initialize() {
     cudfHiveConfigurationValues[cudf_velox::connector::hive::CudfHiveConfig::
                                     kAllowMismatchedCudfHiveSchemas] =
         std::to_string(true);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInput] =
+            std::to_string(FLAGS_cudf_hive_use_buffered_input);
     auto cudfHiveProperties = std::make_shared<const config::ConfigBase>(
         std::move(cudfHiveConfigurationValues));
 
@@ -117,6 +124,9 @@ CudfTpchBenchmark::makeConnectorProperties() {
   cfg->set(
       CudfHiveCfg::kMaxPassReadLimit,
       std::to_string(FLAGS_cudf_pass_read_limit));
+  cfg->set(
+      CudfHiveCfg::kUseBufferedInput,
+      std::to_string(FLAGS_cudf_hive_use_buffered_input));
   cfg->set(CudfHiveCfg::kAllowMismatchedCudfHiveSchemas, "true");
 
   return cfg;
