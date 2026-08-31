@@ -23,6 +23,7 @@ add_library(
   CudfHiveTableHandle.cpp
   CudfSplitReader.cpp
   CudfSplitReaderIOHelpers.cpp
+  PinnedStagingArena.cpp
 )
 
 target_link_libraries(
