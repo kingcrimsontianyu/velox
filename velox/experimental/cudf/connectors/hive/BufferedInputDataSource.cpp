@@ -23,11 +23,7 @@
 
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/host_worker_pool.hpp>
-#include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/io/datasource.hpp>
-#include <cudf/io/parquet.hpp>
-#include <cudf/io/parquet_io_utils.hpp>
-#include <cudf/io/types.hpp>
 
 #include <rmm/cuda_device.hpp>
 
@@ -38,8 +34,8 @@
 #include <future>
 #include <limits>
 #include <mutex>
-#include <numeric>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -66,8 +62,24 @@ const std::string kStagingTransfers = "cudfPinnedStagingTransfers";
 const std::string kStagingBytes = "cudfPinnedStagingBytes";
 const std::string kStagingWindows = "cudfPinnedStagingWindows";
 const std::string kStagingAcquireNanos = "cudfPinnedStagingAcquireNanos";
+const std::string kStagingContendedAcquisitions =
+    "cudfPinnedStagingContendedAcquisitions";
+// These are per-acquisition distribution samples. Their RuntimeMetric sum is
+// not a gauge; use count/min/max (or sum/count) when interpreting them.
+const std::string kStagingActiveLeasesAtAcquireSamples =
+    "cudfPinnedStagingActiveLeasesAtAcquireSamples";
+const std::string kStagingWindowSetCapacityAtAcquireSamples =
+    "cudfPinnedStagingWindowSetCapacityAtAcquireSamples";
 const std::string kStagingPackNanos = "cudfPinnedStagingPackNanos";
 const std::string kStagingH2DWaitNanos = "cudfPinnedStagingH2DWaitNanos";
+const std::string kStagingMemcpyBatchAttempts =
+    "cudfPinnedStagingMemcpyBatchAttempts";
+const std::string kStagingMemcpyBatchCopies =
+    "cudfPinnedStagingMemcpyBatchCopies";
+const std::string kStagingNativeMemcpyBatchAttempts =
+    "cudfPinnedStagingNativeMemcpyBatchAttempts";
+const std::string kStagingNativeMemcpyBatchCopies =
+    "cudfPinnedStagingNativeMemcpyBatchCopies";
 const std::string kStagingFallbacks = "cudfPinnedStagingFallbacks";
 const std::string kStagingDisabledBypasses =
     "cudfPinnedStagingDisabledBypasses";
@@ -452,7 +464,7 @@ class HostToDeviceTransferPlan {
     }
   }
 
-  static void submitWindow(
+  void submitWindow(
       const WindowBatch& batch,
       CudaEvent& event,
       rmm::cuda_stream_view stream,
@@ -463,6 +475,18 @@ class HostToDeviceTransferPlan {
          begin += kMaximumCopiesPerBatch) {
       const auto count =
           std::min(kMaximumCopiesPerBatch, batch.destinations.size() - begin);
+      addIoCounter(ioStats_, kStagingMemcpyBatchAttempts, 1);
+      addIoCounter(ioStats_, kStagingMemcpyBatchCopies, count);
+#if CUDART_VERSION >= 13000
+      if (!stream.is_default()) {
+        // This is the exact compile/runtime gate used by cuDF's
+        // memcpy_batch_async wrapper. Recording it here lets a profile prove
+        // that a CUDA 13 build reached the native API rather than its loop of
+        // cudaMemcpyAsync fallbacks.
+        addIoCounter(ioStats_, kStagingNativeMemcpyBatchAttempts, 1);
+        addIoCounter(ioStats_, kStagingNativeMemcpyBatchCopies, count);
+      }
+#endif
       CUDF_CUDA_TRY(
           cudf::detail::memcpy_batch_async(
               batch.destinations.data() + begin,
@@ -719,6 +743,18 @@ std::vector<size_t> executeDeviceReadBatch(
         RuntimeCounter::Unit::kNanos);
     if (!stagingWindows.has_value()) {
       addIoCounter(ioStats, kStagingFallbacks, 1);
+    } else {
+      addIoCounter(
+          ioStats,
+          kStagingActiveLeasesAtAcquireSamples,
+          stagingWindows->activeLeasesAtAcquire());
+      addIoCounter(
+          ioStats,
+          kStagingWindowSetCapacityAtAcquireSamples,
+          stagingWindows->windowSetCount());
+      if (stagingWindows->wasContended()) {
+        addIoCounter(ioStats, kStagingContendedAcquisitions, 1);
+      }
     }
   } else if (totalReadBytes >= kMinimumPinnedStagingBytes) {
     addIoCounter(ioStats, kStagingDisabledBypasses, 1);
@@ -729,6 +765,7 @@ std::vector<size_t> executeDeviceReadBatch(
   transfer.submitAndWait(stream, device, std::move(stagingWindows));
   return results;
 }
+
 } // namespace
 
 namespace facebook::velox::cudf_velox::connector::hive {
