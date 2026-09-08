@@ -54,16 +54,52 @@ function configure_dnf_for_cuda {
   fi
 }
 
+function verify_local_ucx_install {
+  local ucx_install_prefix=$1
+  local lib_root=""
+  local module_root=""
+  local candidate
+
+  for candidate in "${ucx_install_prefix}/lib" "${ucx_install_prefix}/lib64"; do
+    if [ -e "${candidate}/ucx/libuct_cuda.so" ] && [ -e "${candidate}/ucx/libuct_ib_efa.so" ]; then
+      lib_root="${candidate}"
+      module_root="${candidate}/ucx"
+      break
+    fi
+  done
+  if [ -z "${module_root}" ]; then
+    echo "Custom UCX install is missing the CUDA or EFA transport module (expected libuct_cuda.so and libuct_ib_efa.so)" >&2
+    return 1
+  fi
+
+  local cmake_root="${lib_root}/cmake/ucx"
+  local package_file
+  for package_file in \
+    ucx-config.cmake \
+    ucx-config-version.cmake \
+    ucx-targets.cmake; do
+    if [ ! -s "${cmake_root}/${package_file}" ]; then
+      echo "Custom UCX install is missing CMake package metadata: ${cmake_root}/${package_file}" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
 function install_ucx {
-  dnf_install rdma-core-devel
+  # This function is sourced by multiple Docker build wrappers. Some invoke it
+  # from an AND-list, where Bash deliberately disables errexit for the entire
+  # function body. Explicitly propagate the local-source setup and build
+  # failures so a partial custom UCX installation cannot pass validation.
+  dnf_install rdma-core-devel || return $?
   local UCX_REPO_NAME="openucx/ucx"
   local NEEDS_AUTOGEN=false
   local IS_LOCAL_SOURCE=false
 
   if [ -n "${VELOX_UCX_LOCAL_SOURCE}" ] && [ -f "${VELOX_UCX_LOCAL_SOURCE}/autogen.sh" ]; then
-    rm -rf "${DEPENDENCY_DIR}"/ucx
-    mkdir -p "${DEPENDENCY_DIR}"/ucx
-    cp -a "${VELOX_UCX_LOCAL_SOURCE}"/. "${DEPENDENCY_DIR}"/ucx/
+    rm -rf "${DEPENDENCY_DIR}"/ucx || return $?
+    mkdir -p "${DEPENDENCY_DIR}"/ucx || return $?
+    cp -a "${VELOX_UCX_LOCAL_SOURCE}"/. "${DEPENDENCY_DIR}"/ucx/ || return $?
     NEEDS_AUTOGEN=true
     IS_LOCAL_SOURCE=true
   elif [ -n "${VELOX_UCX_LOCAL_SOURCE}" ] && [ ! -d "${VELOX_UCX_LOCAL_SOURCE}" ]; then
@@ -79,7 +115,7 @@ function install_ucx {
   (
     cd "${DEPENDENCY_DIR}"/ucx || exit
     if [ "${NEEDS_AUTOGEN}" = true ]; then
-      ./autogen.sh
+      ./autogen.sh || exit $?
     fi
 
     local -a ACCELERATOR_FLAGS=()
@@ -104,26 +140,17 @@ function install_ucx {
       ACCELERATOR_FLAGS+=("--with-cuda=/usr/local/cuda")
     fi
 
-    mkdir build-linux && cd build-linux
+    mkdir build-linux || exit $?
+    cd build-linux || exit $?
 
     ../contrib/configure-release --prefix="${INSTALL_PREFIX}" --with-sysroot --enable-cma \
       --enable-mt --with-gnu-ld --with-rdmacm --with-verbs \
-      --without-go --without-java "${ACCELERATOR_FLAGS[@]}"
-    make "-j${NPROC}"
-    make install
+      --without-go --without-java "${ACCELERATOR_FLAGS[@]}" || exit $?
+    make "-j${NPROC}" || exit $?
+    make install || exit $?
 
     if [ "${IS_LOCAL_SOURCE}" = true ]; then
-      local module_root=""
-      for candidate in "${INSTALL_PREFIX}/lib/ucx" "${INSTALL_PREFIX}/lib64/ucx"; do
-        if [ -e "${candidate}/libuct_cuda.so" ] && [ -e "${candidate}/libuct_ib_efa.so" ]; then
-          module_root="${candidate}"
-          break
-        fi
-      done
-      if [ -z "${module_root}" ]; then
-        echo "Custom UCX install is missing the CUDA or EFA transport module (expected libuct_cuda.so and libuct_ib_efa.so)" >&2
-        exit 1
-      fi
+      verify_local_ucx_install "${INSTALL_PREFIX}" || exit $?
     fi
   )
 }
