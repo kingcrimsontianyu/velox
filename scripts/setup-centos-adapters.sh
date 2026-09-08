@@ -27,11 +27,18 @@
 #   CUDA_VERSION from the env
 # * VELOX_UCX_VERSION="1.20.1": Which version of ucx to install, will pick up
 #   UCX_VERSION from the env
+# * VELOX_UCX_LOCAL_SOURCE="": Optional local UCX source tree to install
+#   instead of downloading UCX_VERSION. Picks up UCX_LOCAL_SOURCE from the env.
+#   Local sources are built with CUDA and EFA enabled; configuration fails when
+#   either development environment is unavailable. An existing directory
+#   without autogen.sh is treated as no override so Docker's ordinary-build
+#   sentinel can retain the versioned-download path.
 
 set -efx -o pipefail
 
 VELOX_CUDA_VERSION=${CUDA_VERSION:-"12.9"}
 VELOX_UCX_VERSION=${UCX_VERSION:-"1.20.1"}
+VELOX_UCX_LOCAL_SOURCE=${UCX_LOCAL_SOURCE:-""}
 SCRIPT_DIR=$(dirname "${BASH_SOURCE[0]}")
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR"/setup-centos9.sh
@@ -51,8 +58,18 @@ function install_ucx {
   dnf_install rdma-core-devel
   local UCX_REPO_NAME="openucx/ucx"
   local NEEDS_AUTOGEN=false
+  local IS_LOCAL_SOURCE=false
 
-  if [ "${VELOX_UCX_VERSION}" == "master" ]; then
+  if [ -n "${VELOX_UCX_LOCAL_SOURCE}" ] && [ -f "${VELOX_UCX_LOCAL_SOURCE}/autogen.sh" ]; then
+    rm -rf "${DEPENDENCY_DIR}"/ucx
+    mkdir -p "${DEPENDENCY_DIR}"/ucx
+    cp -a "${VELOX_UCX_LOCAL_SOURCE}"/. "${DEPENDENCY_DIR}"/ucx/
+    NEEDS_AUTOGEN=true
+    IS_LOCAL_SOURCE=true
+  elif [ -n "${VELOX_UCX_LOCAL_SOURCE}" ] && [ ! -d "${VELOX_UCX_LOCAL_SOURCE}" ]; then
+    echo "UCX_LOCAL_SOURCE does not exist or is not a directory: ${VELOX_UCX_LOCAL_SOURCE}" >&2
+    return 1
+  elif [ "${VELOX_UCX_VERSION}" == "master" ]; then
     github_checkout "${UCX_REPO_NAME}" "${VELOX_UCX_VERSION}"
     NEEDS_AUTOGEN=true
   else
@@ -65,18 +82,49 @@ function install_ucx {
       ./autogen.sh
     fi
 
-    local CUDA_FLAG=""
-    if [ -d "/usr/local/cuda" ]; then
-      CUDA_FLAG="--with-cuda=/usr/local/cuda"
+    local -a ACCELERATOR_FLAGS=()
+    if [ "${IS_LOCAL_SOURCE}" = true ]; then
+      if [ ! -d "/usr/local/cuda" ]; then
+        echo "UCX_LOCAL_SOURCE requires the CUDA development tree at /usr/local/cuda" >&2
+        exit 1
+      fi
+      # SRD is supplied by UCX's EFA transport, not by generic verbs support.
+      # Passing --with-efa (rather than relying on auto-detection) makes a
+      # missing libefa library or efadv.h header a configure-time error.
+      # GDA-KI is an independent MLX5/DOCA GPUNetIO transport. CUDA's presence
+      # enables it by default in UCX 1.22 even when its GPUNetIO submodule or
+      # development headers are absent, deferring failure until make install.
+      # It is not used by the EFA SRD or CUDA IPC/copy transports required here.
+      ACCELERATOR_FLAGS+=(
+        "--with-cuda=/usr/local/cuda"
+        "--with-efa"
+        "--without-gda"
+      )
+    elif [ -d "/usr/local/cuda" ]; then
+      ACCELERATOR_FLAGS+=("--with-cuda=/usr/local/cuda")
     fi
 
     mkdir build-linux && cd build-linux
 
     ../contrib/configure-release --prefix="${INSTALL_PREFIX}" --with-sysroot --enable-cma \
       --enable-mt --with-gnu-ld --with-rdmacm --with-verbs \
-      --without-go --without-java ${CUDA_FLAG}
+      --without-go --without-java "${ACCELERATOR_FLAGS[@]}"
     make "-j${NPROC}"
     make install
+
+    if [ "${IS_LOCAL_SOURCE}" = true ]; then
+      local module_root=""
+      for candidate in "${INSTALL_PREFIX}/lib/ucx" "${INSTALL_PREFIX}/lib64/ucx"; do
+        if [ -e "${candidate}/libuct_cuda.so" ] && [ -e "${candidate}/libuct_ib_efa.so" ]; then
+          module_root="${candidate}"
+          break
+        fi
+      done
+      if [ -z "${module_root}" ]; then
+        echo "Custom UCX install is missing the CUDA or EFA transport module (expected libuct_cuda.so and libuct_ib_efa.so)" >&2
+        exit 1
+      fi
+    fi
   )
 }
 

@@ -81,13 +81,26 @@ set(
 set(VELOX_cudf_SOURCE_URL "https://github.com/kjmph/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
 
-# Probe for a system UCX install, to pick the default for
+# Probe for a CUDA-enabled system UCX install, to pick the default for
 # VELOX_ENABLE_UCX_EXCHANGE below. velox_ucx_exchange runs its own
 # find_package(ucx REQUIRED); this probe only decides whether we opt in by
-# default and whether ucxx is fetched.
+# default and whether ucxx is fetched. libucp alone is insufficient: a distro
+# can ship a CPU-only UCX that accepts CUDA pointers at compile time but fails
+# transfers at runtime because the dynamically loaded cuda_copy transport is
+# absent.
 find_library(UCX_LIBRARY NAMES ucp)
 find_path(UCX_INCLUDE_DIR NAMES ucp/api/ucp.h)
-if(UCX_LIBRARY AND UCX_INCLUDE_DIR)
+unset(VELOX_UCX_CUDA_LIBRARY CACHE)
+if(UCX_LIBRARY)
+  get_filename_component(UCX_LIBRARY_DIR "${UCX_LIBRARY}" DIRECTORY)
+  find_library(
+    VELOX_UCX_CUDA_LIBRARY
+    NAMES uct_cuda
+    PATHS "${UCX_LIBRARY_DIR}/ucx"
+    NO_DEFAULT_PATH
+  )
+endif()
+if(UCX_LIBRARY AND UCX_INCLUDE_DIR AND VELOX_UCX_CUDA_LIBRARY)
   set(UCX_FOUND TRUE)
 else()
   set(UCX_FOUND FALSE)
@@ -104,20 +117,22 @@ endif()
 # file is only reached when cuDF is enabled and the transport links cudf::cudf.
 option(
   VELOX_ENABLE_UCX_EXCHANGE
-  "Build the experimental UCX GPU exchange transport. Requires a system UCX install."
+  "Build the experimental UCX GPU exchange transport. Requires a CUDA-enabled system UCX install."
   ${UCX_FOUND}
 )
 if(VELOX_ENABLE_UCX_EXCHANGE AND NOT UCX_FOUND)
   message(
     FATAL_ERROR
-    "VELOX_ENABLE_UCX_EXCHANGE=ON but no system UCX was found (need libucp and ucp/api/ucp.h)."
+    "VELOX_ENABLE_UCX_EXCHANGE=ON but no CUDA-enabled system UCX was found "
+    "(need libucp, ucp/api/ucp.h, and the libuct_cuda transport module)."
   )
 endif()
 
 if(VELOX_ENABLE_UCX_EXCHANGE)
   message(
     STATUS
-    "UCX exchange enabled with ${UCX_LIBRARY} (headers: ${UCX_INCLUDE_DIR}) -- ucxx will be fetched"
+    "UCX exchange enabled with ${UCX_LIBRARY} (headers: ${UCX_INCLUDE_DIR}; "
+    "CUDA transport: ${VELOX_UCX_CUDA_LIBRARY}) -- ucxx will be fetched"
   )
   # ucxx commit b7faed1 from 2026-07-23 (release/0.51 branch)
   set(VELOX_ucxx_VERSION 0.51)
