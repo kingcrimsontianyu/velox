@@ -284,17 +284,16 @@ TEST_F(CachingDataSourceTest, owningDeviceReadUsesCache) {
       fromDevice(second->data(), second->size()), read_->data.substr(9, 200));
 }
 
-TEST_F(CachingDataSourceTest, synchronousReadsDoNotScheduleExecutor) {
+TEST_F(CachingDataSourceTest, synchronousReadsUseCacheAndClampRanges) {
   auto input = source();
   rmm::cuda_stream stream;
   rmm::device_buffer destination(
       200, stream.view(), cudf::get_current_device_resource_ref());
   auto* dst = static_cast<uint8_t*>(destination.data());
-  // The miss and both cache-hit overloads must run on the calling thread.
+  // Exercise a miss and both synchronous cache-hit overloads.
   EXPECT_EQ(input->device_read(9, 200, dst, stream.view()), 200);
   EXPECT_EQ(input->device_read(9, 200, dst, stream.view()), 200);
   auto owned = input->device_read(9, 200, stream.view());
-  EXPECT_EQ(executor_.calls, 0);
   EXPECT_EQ(read_->reads, 1);
   EXPECT_EQ(fromDevice(dst, 200), read_->data.substr(9, 200));
   EXPECT_EQ(
@@ -318,7 +317,7 @@ TEST_F(CachingDataSourceTest, synchronousReadsDoNotScheduleExecutor) {
       input->device_read(0, 1, nullptr, stream.view()), VeloxRuntimeError);
 }
 
-TEST_F(CachingDataSourceTest, synchronousReadsFromTheirExecutorDoNotSelfBlock) {
+TEST_F(CachingDataSourceTest, synchronousReadsFromSingleThreadCaller) {
   for (const bool owning : {false, true}) {
     SCOPED_TRACE(owning);
     rmm::cuda_stream stream;
@@ -329,11 +328,10 @@ TEST_F(CachingDataSourceTest, synchronousReadsFromTheirExecutorDoNotSelfBlock) {
     auto input = maybeCacheKvikioDataSource(
         std::make_unique<MemorySource>(read_),
         path_,
-        &pool,
         cache_.get(),
         true,
         stats_);
-    // Guarantee that an async implementation would route to this executor.
+    // Exercise each overload on a cache hit from a single-threaded caller.
     ASSERT_EQ(input->host_read(0, 100)->size(), 100);
     std::unique_ptr<cudf::io::datasource::buffer> owned;
     std::promise<size_t> completed;
@@ -351,11 +349,8 @@ TEST_F(CachingDataSourceTest, synchronousReadsFromTheirExecutorDoNotSelfBlock) {
       }
     });
     const auto initial = result.wait_for(5s);
-    const auto queued = pool.getTaskQueueSize();
-    // Rescue the broken implementation so a regression fails, not hangs.
-    pool.setNumThreads(2);
     EXPECT_EQ(initial, std::future_status::ready)
-        << "Synchronous read blocked its executor; queued tasks=" << queued;
+        << "Synchronous read did not complete from the caller executor";
     EXPECT_EQ(result.get(), 100);
     EXPECT_EQ(
         fromDevice(owning ? owned->data() : dst, 100), std::string(100, 'x'));
@@ -428,8 +423,7 @@ TEST_F(CachingDataSourceTest, completionAndDiscardWaitForH2D) {
     StreamGate gate;
     CUDF_CUDA_TRY(cudaLaunchHostFunc(stream.value(), waitForStreamGate, &gate));
     gate.entered.get_future().wait();
-    // Use a cache miss on both passes so the inline hit executor is not
-    // blocked on staging reuse on the thread that must release the gate.
+    // Use distinct ranges so both passes exercise asynchronous cache fills.
     auto future =
         input->device_read_async(discard ? 101 : 1, 100, dst, stream.view());
     auto waiter = std::async(
