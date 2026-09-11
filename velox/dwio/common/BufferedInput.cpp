@@ -120,7 +120,32 @@ void BufferedInput::reset() {
   offsets_.clear();
   buffers_.clear();
   enqueuedToBufferOffset_.clear();
-  allocPool_->clear();
+  clearAllocations();
+}
+
+void BufferedInput::clearAllocations() {
+  if (allocPool_.use_count() == 1) {
+    allocPool_->clear();
+  } else {
+    // Readers may still be packing or transferring data from the old load.
+    // Its last retained region releases the old allocation pool.
+    allocPool_ = std::make_shared<memory::AllocationPool>(pool_);
+  }
+}
+
+std::optional<RetainedBufferedRegion> BufferedInput::retainedBufferedRegion(
+    uint64_t offset,
+    uint64_t length) const {
+  if (length == 0 || offset > input_->getLength() ||
+      length > input_->getLength() - offset) {
+    return std::nullopt;
+  }
+  const auto [data, size] = readInternal(offset, length);
+  if (size == MAX_UINT64) {
+    return std::nullopt;
+  }
+  return RetainedBufferedRegion{
+      pool_->shared_from_this(), allocPool_, data, size};
 }
 
 void BufferedInput::load(const LogType logType) {
@@ -131,7 +156,7 @@ void BufferedInput::load(const LogType logType) {
 
   offsets_.clear();
   buffers_.clear();
-  allocPool_->clear();
+  clearAllocations();
 
   sortRegions();
   mergeRegions();

@@ -19,6 +19,7 @@
 #include "velox/common/caching/FileIds.h"
 #include "velox/common/caching/ScanTracker.h"
 #include "velox/common/io/IoStatistics.h"
+#include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/common/InputStream.h"
 #include "velox/dwio/common/SeekableInputStream.h"
 
@@ -42,6 +43,13 @@ class DirectInputStream : public SeekableInputStream {
       int32_t loadQuantum);
 
   bool Next(const void** data, int* size) override;
+
+  /// Like Next(), but retains the returned allocation across subsequent reads
+  /// and destruction of the stream and input. Must first be called before any
+  /// data is loaded. Only this opt-in path uses shared buffer ownership; normal
+  /// CPU readers continue to reuse their private allocations. Returns nullopt
+  /// at EOF. The returned region is not CUDA-pinned.
+  std::optional<RetainedBufferedRegion> nextRetained();
   void BackUp(int count) override;
   bool SkipInt64(int64_t count) override;
   int64_t ByteCount() const override;
@@ -56,8 +64,8 @@ class DirectInputStream : public SeekableInputStream {
       memory::Allocation*& data,
       std::string*& tinyData) {
     loadedRegion = loadedRegion_;
-    data = &data_;
-    tinyData = &tinyData_;
+    data = &readData();
+    tinyData = &readTinyData();
   }
 
  private:
@@ -66,6 +74,14 @@ class DirectInputStream : public SeekableInputStream {
 
   // Synchronously sets 'data_' to cover loadedRegion_'.
   void loadSync();
+
+  memory::Allocation& readData() {
+    return retainedData_ ? retainedData_->data : data_;
+  }
+
+  std::string& readTinyData() {
+    return retainedData_ ? retainedData_->tinyData : tinyData_;
+  }
 
   DirectBufferedInput* const bufferedInput_;
   IoStatistics* const ioStats_;
@@ -90,6 +106,12 @@ class DirectInputStream : public SeekableInputStream {
 
   // Contains the data if the range is too small for Allocation.
   std::string tinyData_;
+
+  struct RetainedData {
+    memory::Allocation data;
+    std::string tinyData;
+  };
+  std::shared_ptr<RetainedData> retainedData_;
 
   // Pointer to start of current run in 'entry->nonContiguousData()' or
   // 'entry->contiguousData()'.

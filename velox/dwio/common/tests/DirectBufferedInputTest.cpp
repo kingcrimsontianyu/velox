@@ -28,6 +28,7 @@
 #include "velox/common/io/IoStatistics.h"
 #include "velox/common/io/Options.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/dwio/common/DirectInputStream.h"
 
 using namespace facebook::velox;
 using namespace facebook::velox::dwio::common;
@@ -202,6 +203,101 @@ TEST_F(DirectBufferedInputTest, reset) {
     stream3.reset();
     stream4.reset();
     ASSERT_EQ(pool_->usedBytes(), 0);
+  }
+}
+
+TEST_F(DirectBufferedInputTest, retainedReadsSurviveStreamAndInput) {
+  // Cover small-string storage, heap strings, multiple allocation runs, and
+  // rollover beyond the load quantum, with and without coalesced/preloaded IO.
+  for (const size_t length : {13, 800, 3 * (64 << 10) + 17}) {
+    for (const std::string mode : {"demand", "coalesced", "preloaded"}) {
+      SCOPED_TRACE(fmt::format("length={} mode={}", length, mode));
+      std::string content(length, '\0');
+      for (size_t i = 0; i < length; ++i) {
+        content[i] = static_cast<char>(i % 251);
+      }
+      io::ReaderOptions options(pool_.get());
+      options.setLoadQuantum(64 << 10);
+      auto input = std::make_unique<DirectBufferedInput>(
+          std::make_shared<InMemoryReadFile>(content),
+          MetricsLog::voidLog(),
+          StringIdLease(fileIds(), "retained-file"),
+          tracker_,
+          StringIdLease(fileIds(), "retained-group"),
+          dataIoStats_,
+          nullptr,
+          nullptr,
+          options);
+      if (mode == "preloaded") {
+        input->preload();
+      }
+      auto stream = mode == "coalesced"
+          ? input->enqueue(common::Region{0, length}, nullptr)
+          : input->read(0, length, LogType::TEST);
+      if (mode == "coalesced") {
+        input->load(LogType::TEST);
+      }
+      auto* direct = dynamic_cast<DirectInputStream*>(stream.get());
+      ASSERT_NE(direct, nullptr);
+      std::vector<RetainedBufferedRegion> regions;
+      while (auto region = direct->nextRetained()) {
+        ASSERT_GT(region->size(), 0);
+        // A retained view must point at the actual stream allocation, not a
+        // replacement byte copy (including the small-string case).
+        direct->BackUp(region->size());
+        const void* data = nullptr;
+        int size = 0;
+        ASSERT_TRUE(direct->Next(&data, &size));
+        EXPECT_EQ(data, region->data());
+        EXPECT_EQ(size, region->size());
+        regions.push_back(std::move(*region));
+      }
+      EXPECT_EQ(direct->ByteCount(), length);
+      stream.reset();
+      input->reset();
+      input.reset();
+      std::string actual;
+      for (const auto& region : regions) {
+        actual.append(region.data(), region.size());
+      }
+      EXPECT_EQ(actual, content);
+      regions.clear();
+      EXPECT_EQ(pool_->usedBytes(), 0);
+    }
+  }
+}
+
+TEST_F(DirectBufferedInputTest, retainedReadKeepsPoolAlive) {
+  for (bool preload : {false, true}) {
+    auto pool = rootPool_->addLeafChild("retained-pool");
+    std::weak_ptr<MemoryPool> weakPool = pool;
+    const std::string content(32 << 10, 'p');
+    io::ReaderOptions options(pool.get());
+    auto input = std::make_unique<DirectBufferedInput>(
+        std::make_shared<InMemoryReadFile>(content),
+        MetricsLog::voidLog(),
+        StringIdLease(fileIds(), "pool-file"),
+        tracker_,
+        StringIdLease(fileIds(), "pool-group"),
+        dataIoStats_,
+        nullptr,
+        nullptr,
+        options);
+    if (preload) {
+      input->preload();
+    }
+    auto stream = input->read(0, content.size(), LogType::TEST);
+    auto retained = dynamic_cast<DirectInputStream&>(*stream).nextRetained();
+    ASSERT_TRUE(retained.has_value());
+    stream.reset();
+    input.reset();
+    pool.reset();
+    EXPECT_FALSE(weakPool.expired());
+    EXPECT_EQ(
+        std::string(retained->data(), retained->size()),
+        content.substr(0, retained->size()));
+    retained.reset();
+    EXPECT_TRUE(weakPool.expired());
   }
 }
 

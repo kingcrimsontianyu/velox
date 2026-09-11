@@ -168,7 +168,7 @@ class DirectBufferedInput : public BufferedInput {
   void preload() override;
 
   bool preloaded() const override {
-    return preloadData_.has_value();
+    return preloadData_ != nullptr;
   }
 
   void load(const LogType /*unused*/) override;
@@ -208,6 +208,11 @@ class DirectBufferedInput : public BufferedInput {
   /// file, up to 'length' bytes. Caller must call preload() first and ensure
   /// 'offset' < file size.
   folly::Range<const char*> preloadedData(uint64_t offset, uint64_t length)
+      const;
+
+  /// Like preloadedData(), but retains the backing allocation and memory pool
+  /// independently of this input. The returned region is not CUDA-pinned.
+  RetainedBufferedRegion retainedPreloadedData(uint64_t offset, uint64_t length)
       const;
 
   /// Returns the CoalescedLoad that contains the correlated loads for
@@ -328,7 +333,7 @@ class DirectBufferedInput : public BufferedInput {
     std::string tinyData;
     uint64_t size;
   };
-  std::optional<PreloadData> preloadData_;
+  std::shared_ptr<PreloadData> preloadData_;
 };
 
 } // namespace facebook::velox::dwio::common

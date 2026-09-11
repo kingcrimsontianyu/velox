@@ -69,6 +69,27 @@ bool DirectInputStream::Next(const void** buffer, int32_t* size) {
   return true;
 }
 
+std::optional<RetainedBufferedRegion> DirectInputStream::nextRetained() {
+  if (!retainedData_) {
+    VELOX_CHECK(!loaded_, "Retention must be enabled before loading data");
+    retainedData_ = std::make_shared<RetainedData>();
+  }
+  const auto offset = region_.offset + offsetInRegion_;
+  const void* data = nullptr;
+  int size = 0;
+  if (!Next(&data, &size)) {
+    return std::nullopt;
+  }
+  if (bufferedInput_->preloaded()) {
+    return bufferedInput_->retainedPreloadedData(offset, size);
+  }
+  return RetainedBufferedRegion(
+      bufferedInput_->pool()->shared_from_this(),
+      retainedData_,
+      static_cast<const char*>(data),
+      size);
+}
+
 void DirectInputStream::BackUp(int32_t count) {
   VELOX_CHECK_GE(count, 0, "can't backup negative distances");
 
@@ -131,19 +152,25 @@ makeRanges(size_t size, memory::Allocation& data, std::string& tinyData) {
 } // namespace
 
 void DirectInputStream::loadSync() {
-  if (region_.length < DirectBufferedInput::kTinySize &&
-      data_.numPages() == 0) {
-    tinyData_.resize(region_.length);
+  // Never overwrite a quantum still referenced by an asynchronous consumer.
+  // If all retained views have been released, reuse the buffer as before.
+  if (retainedData_ && retainedData_.use_count() > 1) {
+    retainedData_ = std::make_shared<RetainedData>();
+  }
+  auto& data = readData();
+  auto& tinyData = readTinyData();
+  if (region_.length < DirectBufferedInput::kTinySize && data.numPages() == 0) {
+    tinyData.resize(region_.length);
   } else {
     const auto numPages =
         memory::AllocationTraits::numPages(loadedRegion_.length);
-    if (numPages > data_.numPages()) {
-      bufferedInput_->pool()->allocateNonContiguous(numPages, data_);
+    if (numPages > data.numPages()) {
+      bufferedInput_->pool()->allocateNonContiguous(numPages, data);
     }
   }
 
   ioStats_->incRawBytesRead(loadedRegion_.length);
-  auto ranges = makeRanges(loadedRegion_.length, data_, tinyData_);
+  auto ranges = makeRanges(loadedRegion_.length, data, tinyData);
   uint64_t usecs = 0;
   {
     MicrosecondWallTimer timer(&usecs);
@@ -186,7 +213,8 @@ void DirectInputStream::loadPosition() {
           waitFuture.wait();
         }
         loadedRegion_.offset = region_.offset;
-        loadedRegion_.length = load->getData(region_.offset, data_, tinyData_);
+        loadedRegion_.length =
+            load->getData(region_.offset, readData(), readTinyData());
       }
       ioStats_->queryThreadIoLatencyUs().increment(loadUs);
       // DirectCoalescedLoad always reads from remote storage, not SSD.
@@ -215,15 +243,17 @@ void DirectInputStream::loadPosition() {
 
   const auto offsetInData =
       offsetInRegion_ - (loadedRegion_.offset - region_.offset);
-  if (data_.numPages() == 0) {
-    run_ = reinterpret_cast<uint8_t*>(tinyData_.data());
-    runSize_ = tinyData_.size();
+  auto& data = readData();
+  auto& tinyData = readTinyData();
+  if (data.numPages() == 0) {
+    run_ = reinterpret_cast<uint8_t*>(tinyData.data());
+    runSize_ = tinyData.size();
     offsetInRun_ = offsetInData;
     offsetOfRun_ = 0;
   } else {
-    data_.findRun(offsetInData, &runIndex_, &offsetInRun_);
+    data.findRun(offsetInData, &runIndex_, &offsetInRun_);
     offsetOfRun_ = offsetInData - offsetInRun_;
-    auto run = data_.runAt(runIndex_);
+    auto run = data.runAt(runIndex_);
     run_ = run.data();
     runSize_ = memory::AllocationTraits::pageBytes(run.numPages());
     if (offsetOfRun_ + runSize_ > loadedRegion_.length) {

@@ -67,6 +67,46 @@ class CachedRegion {
   std::vector<folly::Range<const char*>> ranges_;
 };
 
+/// A zero-copy view of a loaded, non-cache input region. Retains the
+/// backing allocation and its memory pool across subsequent loads, reset(),
+/// and destruction of the input. This does not pin or register memory for DMA.
+class RetainedBufferedRegion {
+ public:
+  RetainedBufferedRegion(const RetainedBufferedRegion&) = default;
+  RetainedBufferedRegion(RetainedBufferedRegion&&) noexcept = default;
+  RetainedBufferedRegion& operator=(const RetainedBufferedRegion&) = delete;
+  RetainedBufferedRegion& operator=(RetainedBufferedRegion&&) = delete;
+
+  const char* data() const {
+    return data_;
+  }
+
+  uint64_t size() const {
+    return size_;
+  }
+
+ private:
+  friend class BufferedInput;
+  friend class DirectBufferedInput;
+  friend class DirectInputStream;
+
+  RetainedBufferedRegion(
+      std::shared_ptr<memory::MemoryPool> pool,
+      std::shared_ptr<void> allocation,
+      const char* data,
+      uint64_t size)
+      : pool_(std::move(pool)),
+        allocation_(std::move(allocation)),
+        data_(data),
+        size_(size) {}
+
+  // Destroy the allocation before releasing its memory pool.
+  std::shared_ptr<memory::MemoryPool> pool_;
+  std::shared_ptr<void> allocation_;
+  const char* data_;
+  uint64_t size_;
+};
+
 class BufferedInput {
  public:
   constexpr static uint64_t kMaxMergeDistance = 1024 * 1024 * 1.25;
@@ -102,7 +142,7 @@ class BufferedInput {
         pool_{&pool},
         maxMergeDistance_{maxMergeDistance},
         wsVRLoad_{wsVRLoad},
-        allocPool_{std::make_unique<memory::AllocationPool>(&pool)} {}
+        allocPool_{std::make_shared<memory::AllocationPool>(&pool)} {}
 
   BufferedInput(BufferedInput&&) = default;
   virtual ~BufferedInput() = default;
@@ -240,6 +280,15 @@ class BufferedInput {
     VELOX_UNSUPPORTED("findCachedRegion requires a backing cache");
   }
 
+  /// Retains an already-loaded region from this object's base BufferedInput
+  /// storage, without performing I/O or copying. Returns nullopt for an empty
+  /// region or one not wholly covered by a loaded buffer. Subclasses using
+  /// other storage representations are not assumed to support retention.
+  /// Like enqueue/load/read, this method requires external synchronization.
+  std::optional<RetainedBufferedRegion> retainedBufferedRegion(
+      uint64_t offset,
+      uint64_t length) const;
+
   virtual uint64_t nextFetchSize() const;
 
   /// Resets the buffered input for reuse. This is used by index lookup which
@@ -347,6 +396,7 @@ class BufferedInput {
   }
 
   bool useVRead() const;
+  void clearAllocations();
   void sortRegions();
   void mergeRegions();
 
@@ -358,7 +408,10 @@ class BufferedInput {
   bool preloaded_{false};
   uint64_t maxMergeDistance_;
   std::optional<bool> wsVRLoad_;
-  std::unique_ptr<memory::AllocationPool> allocPool_;
+  // A retained region shares the current load's allocation pool. Subsequent
+  // loads replace a shared pool, but keep the normal clear/reuse path when no
+  // consumer has retained data.
+  std::shared_ptr<memory::AllocationPool> allocPool_;
 
   // Regions enqueued for reading
   std::vector<velox::common::Region> regions_;

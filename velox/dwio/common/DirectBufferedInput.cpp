@@ -311,9 +311,9 @@ void copyDuplicateRegion(
 } // namespace
 
 void DirectBufferedInput::preload() {
-  VELOX_CHECK(!preloadData_.has_value(), "preload() called more than once");
+  VELOX_CHECK(!preloadData_, "preload() called more than once");
   VELOX_CHECK(requests_.empty(), "preload() must be called before enqueue()");
-  preloadData_.emplace();
+  preloadData_ = std::make_shared<PreloadData>();
   preloadData_->size = fileSize_;
   uint64_t storageReadUs{0};
   {
@@ -340,7 +340,7 @@ folly::Range<const char*> DirectBufferedInput::preloadedData(
     uint64_t offset,
     uint64_t length) const {
   VELOX_CHECK(
-      preloadData_.has_value(), "preloadedData() called without preload");
+      preloadData_ != nullptr, "preloadedData() called without preload");
   VELOX_CHECK_LT(offset, preloadData_->size, "Offset exceeds preloaded size");
   const auto available =
       std::min<uint64_t>(length, preloadData_->size - offset);
@@ -355,6 +355,14 @@ folly::Range<const char*> DirectBufferedInput::preloadedData(
   const auto contiguousBytes =
       std::min<uint64_t>(available, runBytes - offsetInRun);
   return {run.data<const char>() + offsetInRun, contiguousBytes};
+}
+
+RetainedBufferedRegion DirectBufferedInput::retainedPreloadedData(
+    uint64_t offset,
+    uint64_t length) const {
+  const auto range = preloadedData(offset, length);
+  return RetainedBufferedRegion(
+      pool_->shared_from_this(), preloadData_, range.data(), range.size());
 }
 
 std::unique_ptr<SeekableInputStream> DirectBufferedInput::read(

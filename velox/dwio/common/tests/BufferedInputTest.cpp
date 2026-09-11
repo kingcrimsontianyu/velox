@@ -150,7 +150,9 @@ std::optional<std::string> getNext(SeekableInputStream& input) {
 class BufferedInputTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    MemoryManager::testingSetInstance(MemoryManager::Options{});
+    MemoryManager::Options options;
+    options.trackDefaultUsage = true;
+    MemoryManager::testingSetInstance(options);
   }
 
   const std::shared_ptr<MemoryPool> pool_ = memoryManager()->addLeafPool();
@@ -169,6 +171,62 @@ TEST_F(BufferedInputTest, hasCache) {
       "cacheRegion requires a backing cache");
   VELOX_ASSERT_THROW(
       input.findCachedRegion(0), "findCachedRegion requires a backing cache");
+}
+
+TEST_F(BufferedInputTest, retainedBufferedRegionSurvivesLoadAndReset) {
+  const std::string content = std::string(128, 'a') + std::string(128, 'b');
+  auto input = std::make_unique<BufferedInput>(
+      std::make_shared<facebook::velox::InMemoryReadFile>(content), *pool_);
+  EXPECT_FALSE(input->retainedBufferedRegion(0, 64).has_value());
+  auto stream = input->enqueue({0, 64});
+  input->load(LogType::FILE);
+  auto retained = input->retainedBufferedRegion(8, 32);
+  ASSERT_TRUE(retained.has_value());
+  const void* data = nullptr;
+  int32_t size;
+  ASSERT_TRUE(stream->Next(&data, &size));
+  EXPECT_EQ(retained->data(), static_cast<const char*>(data) + 8);
+  EXPECT_EQ(retained->size(), 32);
+
+  EXPECT_FALSE(input->retainedBufferedRegion(0, 0).has_value());
+  EXPECT_FALSE(input->retainedBufferedRegion(32, 64).has_value());
+  EXPECT_FALSE(input->retainedBufferedRegion(UINT64_MAX, 1).has_value());
+  EXPECT_FALSE(input->retainedBufferedRegion(1, UINT64_MAX).has_value());
+
+  auto next = input->enqueue({128, 64});
+  input->load(LogType::FILE);
+  EXPECT_EQ(getNext(*next), std::string(64, 'b'));
+  EXPECT_EQ(
+      std::string(retained->data(), retained->size()), std::string(32, 'a'));
+  input->reset();
+  EXPECT_FALSE(input->retainedBufferedRegion(128, 64).has_value());
+  input.reset();
+  EXPECT_EQ(
+      std::string(retained->data(), retained->size()), std::string(32, 'a'));
+  EXPECT_GT(pool_->usedBytes(), 0);
+  retained.reset();
+  EXPECT_EQ(pool_->usedBytes(), 0);
+}
+
+TEST_F(BufferedInputTest, retainedBufferedRegionKeepsPoolAlive) {
+  auto pool = memoryManager()->addLeafPool();
+  std::weak_ptr<MemoryPool> weakPool = pool;
+  std::optional<RetainedBufferedRegion> retained;
+  {
+    BufferedInput input(
+        std::make_shared<facebook::velox::InMemoryReadFile>(
+            std::string(128, 'r')),
+        *pool);
+    input.enqueue({0, 128});
+    input.load(LogType::FILE);
+    retained.emplace(*input.retainedBufferedRegion(0, 128));
+  }
+  pool.reset();
+  EXPECT_FALSE(weakPool.expired());
+  EXPECT_EQ(
+      std::string(retained->data(), retained->size()), std::string(128, 'r'));
+  retained.reset();
+  EXPECT_TRUE(weakPool.expired());
 }
 
 TEST_F(BufferedInputTest, cachedRegion) {
