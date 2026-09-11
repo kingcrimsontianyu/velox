@@ -90,15 +90,6 @@ class MemorySource : public cudf::io::datasource {
   std::shared_ptr<ReadState> state_;
 };
 
-class CountingExecutor : public folly::Executor {
- public:
-  void add(folly::Func function) override {
-    ++calls;
-    function();
-  }
-  size_t calls{0};
-};
-
 struct StreamGate {
   std::promise<void> entered;
   std::promise<void> release;
@@ -122,7 +113,6 @@ class CachingDataSourceTest : public testing::Test {
     return maybeCacheKvikioDataSource(
         std::make_unique<MemorySource>(read_),
         path_,
-        &executor_,
         cache_.get(),
         cacheable,
         stats_);
@@ -143,7 +133,6 @@ class CachingDataSourceTest : public testing::Test {
       cache::AsyncDataCache::create(allocator_.get());
   std::shared_ptr<ReadState> read_ = std::make_shared<ReadState>();
   std::shared_ptr<IoStats> stats_ = std::make_shared<IoStats>();
-  CountingExecutor executor_;
   const std::string path_ = "s3://test/caching-datasource";
 };
 
@@ -154,11 +143,9 @@ TEST_F(CachingDataSourceTest, cacheOffAndNonCacheablePreserveDelegateIdentity) {
     auto actual = maybeCacheKvikioDataSource(
         std::move(delegate),
         path_,
-        &executor_,
         cacheable ? nullptr : cache_.get(),
         cacheable);
     EXPECT_EQ(actual.get(), original);
-    EXPECT_EQ(executor_.calls, 0);
   }
 }
 
@@ -174,7 +161,6 @@ TEST_F(CachingDataSourceTest, hostMissHitAndFileIdentity) {
   auto anotherFile = maybeCacheKvikioDataSource(
       std::make_unique<MemorySource>(read_),
       "s3://test/another-file",
-      &executor_,
       cache_.get(),
       true);
   anotherFile->host_read(17, 512);
@@ -273,17 +259,15 @@ TEST_F(CachingDataSourceTest, hostFutureRetainsDelegate) {
   EXPECT_TRUE(read_->destroyed);
 }
 
-TEST_F(CachingDataSourceTest, remoteMissAndConnectorHitExecutors) {
+TEST_F(CachingDataSourceTest, deviceReadServesSecondReadFromCache) {
   auto input = source();
   rmm::cuda_stream stream;
   rmm::device_buffer destination(
       1024, stream.view(), cudf::get_current_device_resource_ref());
   auto* dst = static_cast<uint8_t*>(destination.data());
   EXPECT_EQ(input->device_read_async(0, 1024, dst, stream.view()).get(), 1024);
-  EXPECT_EQ(executor_.calls, 0);
   EXPECT_EQ(fromDevice(dst, 1024), read_->data.substr(0, 1024));
   EXPECT_EQ(input->device_read_async(0, 1024, dst, stream.view()).get(), 1024);
-  EXPECT_EQ(executor_.calls, 1);
   EXPECT_EQ(read_->reads, 1);
   EXPECT_EQ(fromDevice(dst, 1024), read_->data.substr(0, 1024));
 }
