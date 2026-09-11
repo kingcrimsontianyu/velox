@@ -26,6 +26,7 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <folly/executors/CPUThreadPoolExecutor.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -297,6 +298,104 @@ TEST_F(CachingDataSourceTest, owningDeviceReadUsesCache) {
       fromDevice(first->data(), first->size()), read_->data.substr(9, 200));
   EXPECT_EQ(
       fromDevice(second->data(), second->size()), read_->data.substr(9, 200));
+}
+
+TEST_F(CachingDataSourceTest, synchronousReadsDoNotScheduleExecutor) {
+  auto input = source();
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination(
+      200, stream.view(), cudf::get_current_device_resource_ref());
+  auto* dst = static_cast<uint8_t*>(destination.data());
+  // The miss and both cache-hit overloads must run on the calling thread.
+  EXPECT_EQ(input->device_read(9, 200, dst, stream.view()), 200);
+  EXPECT_EQ(input->device_read(9, 200, dst, stream.view()), 200);
+  auto owned = input->device_read(9, 200, stream.view());
+  EXPECT_EQ(executor_.calls, 0);
+  EXPECT_EQ(read_->reads, 1);
+  EXPECT_EQ(fromDevice(dst, 200), read_->data.substr(9, 200));
+  EXPECT_EQ(
+      fromDevice(owned->data(), owned->size()), read_->data.substr(9, 200));
+
+  EXPECT_EQ(input->device_read(0, 0, nullptr, stream.view()), 0);
+  EXPECT_EQ(input->device_read(input->size(), 1, nullptr, stream.view()), 0);
+  EXPECT_EQ(
+      input->device_read(
+          std::numeric_limits<size_t>::max(), 1, nullptr, stream.view()),
+      0);
+  EXPECT_EQ(
+      input->device_read(
+          input->size() - 3,
+          std::numeric_limits<size_t>::max(),
+          dst,
+          stream.view()),
+      3);
+  EXPECT_EQ(fromDevice(dst, 3), read_->data.substr(input->size() - 3));
+  EXPECT_THROW(
+      input->device_read(0, 1, nullptr, stream.view()), VeloxRuntimeError);
+}
+
+TEST_F(CachingDataSourceTest, synchronousReadsFromTheirExecutorDoNotSelfBlock) {
+  for (const bool owning : {false, true}) {
+    SCOPED_TRACE(owning);
+    rmm::cuda_stream stream;
+    rmm::device_buffer destination(
+        100, stream.view(), cudf::get_current_device_resource_ref());
+    auto* dst = static_cast<uint8_t*>(destination.data());
+    folly::CPUThreadPoolExecutor pool(1);
+    auto input = maybeCacheKvikioDataSource(
+        std::make_unique<MemorySource>(read_),
+        path_,
+        &pool,
+        cache_.get(),
+        true,
+        stats_);
+    // Guarantee that an async implementation would route to this executor.
+    ASSERT_EQ(input->host_read(0, 100)->size(), 100);
+    std::unique_ptr<cudf::io::datasource::buffer> owned;
+    std::promise<size_t> completed;
+    auto result = completed.get_future();
+    pool.add([&] {
+      try {
+        if (owning) {
+          owned = input->device_read(0, 100, stream.view());
+          completed.set_value(owned->size());
+        } else {
+          completed.set_value(input->device_read(0, 100, dst, stream.view()));
+        }
+      } catch (...) {
+        completed.set_exception(std::current_exception());
+      }
+    });
+    const auto initial = result.wait_for(5s);
+    const auto queued = pool.getTaskQueueSize();
+    // Rescue the broken implementation so a regression fails, not hangs.
+    pool.setNumThreads(2);
+    EXPECT_EQ(initial, std::future_status::ready)
+        << "Synchronous read blocked its executor; queued tasks=" << queued;
+    EXPECT_EQ(result.get(), 100);
+    EXPECT_EQ(
+        fromDevice(owning ? owned->data() : dst, 100), std::string(100, 'x'));
+    pool.join();
+  }
+}
+
+TEST_F(CachingDataSourceTest, synchronousReadWaitsForH2D) {
+  auto input = source();
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination(
+      100, stream.view(), cudf::get_current_device_resource_ref());
+  stream.synchronize();
+  auto* dst = static_cast<uint8_t*>(destination.data());
+  StreamGate gate;
+  CUDF_CUDA_TRY(cudaLaunchHostFunc(stream.value(), waitForStreamGate, &gate));
+  gate.entered.get_future().wait();
+  auto waiter = std::async(std::launch::async, [&] {
+    return input->device_read(10, 100, dst, stream.view());
+  });
+  EXPECT_EQ(waiter.wait_for(50ms), std::future_status::timeout);
+  gate.release.set_value();
+  EXPECT_EQ(waiter.get(), 100);
+  EXPECT_EQ(fromDevice(dst, 100), read_->data.substr(10, 100));
 }
 
 TEST_F(CachingDataSourceTest, deviceFutureRetainsDelegate) {

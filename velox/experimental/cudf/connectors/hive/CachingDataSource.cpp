@@ -386,7 +386,20 @@ size_t CachingDataSource::device_read(
     size_t bytes,
     uint8_t* dst,
     rmm::cuda_stream_view stream) {
-  return device_read_async(offset, bytes, dst, stream).get();
+  bytes = state_->clamp(offset, bytes);
+  if (bytes == 0) {
+    return 0;
+  }
+  VELOX_CHECK_NOT_NULL(dst);
+  const auto device = streamDevice(stream);
+  // A synchronous caller may already occupy the connector executor. Queuing
+  // the read back to that executor and waiting would deadlock when all its
+  // threads are occupied by such callers. Keep scheduling in the async API;
+  // perform synchronous reads inline, including the destination-lifetime fence.
+  const auto actual =
+      state_->submitDeviceRead(offset, bytes, dst, stream, device);
+  finishDeviceRead(stream, device);
+  return actual;
 }
 std::unique_ptr<cudf::io::datasource::buffer> CachingDataSource::device_read(
     size_t offset,
