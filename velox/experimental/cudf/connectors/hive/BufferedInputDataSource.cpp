@@ -20,6 +20,7 @@
 
 #include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/common/CacheInputStream.h"
+#include "velox/dwio/common/DirectInputStream.h"
 
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/host_worker_pool.hpp>
@@ -47,6 +48,8 @@ using facebook::velox::cudf_velox::connector::hive::PinnedStagingArena;
 using facebook::velox::dwio::common::BufferedInput;
 using facebook::velox::dwio::common::CachedRegion;
 using facebook::velox::dwio::common::CacheInputStream;
+using facebook::velox::dwio::common::DirectInputStream;
+using facebook::velox::dwio::common::RetainedBufferedRegion;
 
 constexpr size_t kMaximumCopiesPerBatch = 32;
 constexpr size_t kMinimumPinnedStagingBytes = 1ULL << 20;
@@ -56,6 +59,8 @@ const std::string kDeviceReadRequests = "cudfBufferedDeviceReadRequests";
 const std::string kDeviceReadBytes = "cudfBufferedDeviceReadBytes";
 const std::string kDeviceReadFragments = "cudfBufferedDeviceReadFragments";
 const std::string kCacheBackedSourceBytes = "cudfCacheBackedSourceBytes";
+const std::string kBufferedRetainedSourceBytes =
+    "cudfBufferedRetainedSourceBytes";
 const std::string kCopiedSourceBytes = "cudfCopiedSourceBytes";
 const std::string kStagingAttempts = "cudfPinnedStagingAttempts";
 const std::string kStagingTransfers = "cudfPinnedStagingTransfers";
@@ -216,7 +221,8 @@ class CudaEvent {
 };
 
 // Owns every host source referenced by a batch of H2D descriptors. Cache hits
-// retain cache pins directly; the fallback owns copied pageable buffers. The
+// retain cache pins directly; non-cache reads retain loaded allocations when
+// available, with copied pageable buffers as the generic fallback. The
 // submission layer is intentionally independent of source ownership: the same
 // prepared plan can use bounded double-buffered pinned staging or safely fall
 // back to direct pageable copies without changing lifetime/completion rules.
@@ -273,6 +279,23 @@ class HostToDeviceTransferPlan {
         SourceOwner{SourceOwnerKind::kCopied, ownerIndex});
   }
 
+  void addBufferedRegion(RetainedBufferedRegion region, uint8_t* destination) {
+    VELOX_CHECK_GT(region.size(), 0);
+    VELOX_CHECK_LE(
+        region.size(),
+        std::numeric_limits<size_t>::max() - bufferedSourceBytes_,
+        "Buffered source byte count overflows size_t");
+    bufferedSourceBytes_ += region.size();
+    const auto ownerIndex = bufferedRegions_.size();
+    bufferedRegions_.emplace_back(std::move(region));
+    const auto& retained = bufferedRegions_.back().value();
+    addDescriptor(
+        destination,
+        retained.data(),
+        retained.size(),
+        SourceOwner{SourceOwnerKind::kBuffered, ownerIndex});
+  }
+
   void submitAndWait(
       rmm::cuda_stream_view stream,
       int device,
@@ -298,6 +321,13 @@ class HostToDeviceTransferPlan {
           copiedSourceBytes_,
           RuntimeCounter::Unit::kBytes);
     }
+    if (bufferedSourceBytes_ != 0) {
+      addIoCounter(
+          ioStats_,
+          kBufferedRetainedSourceBytes,
+          bufferedSourceBytes_,
+          RuntimeCounter::Unit::kBytes);
+    }
     if (windows.has_value()) {
       addIoCounter(ioStats_, kStagingTransfers, 1);
       addIoCounter(
@@ -312,7 +342,7 @@ class HostToDeviceTransferPlan {
   }
 
  private:
-  enum class SourceOwnerKind : uint8_t { kCached, kCopied };
+  enum class SourceOwnerKind : uint8_t { kCached, kCopied, kBuffered };
 
   struct SourceOwner {
     SourceOwnerKind kind;
@@ -453,6 +483,9 @@ class HostToDeviceTransferPlan {
         if (--remaining == 0) {
           retainedRegions_[owner.index].reset();
         }
+      } else if (owner.kind == SourceOwnerKind::kBuffered) {
+        VELOX_CHECK_LT(owner.index, bufferedRegions_.size());
+        bufferedRegions_[owner.index].reset();
       } else {
         VELOX_CHECK_LT(owner.index, copiedDescriptorCounts_.size());
         auto& remaining = copiedDescriptorCounts_[owner.index];
@@ -598,6 +631,7 @@ class HostToDeviceTransferPlan {
   }
 
   std::vector<std::optional<CachedRegion>> retainedRegions_;
+  std::vector<std::optional<RetainedBufferedRegion>> bufferedRegions_;
   std::vector<size_t> retainedDescriptorCounts_;
   std::vector<std::vector<uint8_t>> copiedRegions_;
   std::vector<size_t> copiedDescriptorCounts_;
@@ -607,6 +641,7 @@ class HostToDeviceTransferPlan {
   std::vector<SourceOwner> owners_;
   std::shared_ptr<IoStats> ioStats_;
   size_t cachedSourceBytes_{0};
+  size_t bufferedSourceBytes_{0};
   size_t copiedSourceBytes_{0};
   size_t totalBytes_{0};
 };
@@ -652,6 +687,14 @@ std::vector<size_t> executeDeviceReadBatch(
           std::numeric_limits<size_t>::max() - totalReadBytes,
           "Total buffered device read size overflows size_t");
       totalReadBytes += readSize;
+      // Preserve a region already in the input before loading any new ranges.
+      // The next load can otherwise invalidate an enqueue() stream referring
+      // to the previous load's buffers.
+      if (auto retained =
+              input->retainedBufferedRegion(request.offset, readSize)) {
+        transfer.addBufferedRegion(std::move(*retained), request.dst);
+        continue;
+      }
       hasReads = true;
       inputStreams[index] = input->enqueue({request.offset, readSize});
       VELOX_CHECK_NOT_NULL(
@@ -674,13 +717,37 @@ std::vector<size_t> executeDeviceReadBatch(
 
     for (size_t index = 0; index < requests.size(); ++index) {
       const auto readSize = results[index];
-      if (readSize == 0) {
+      if (readSize == 0 || inputStreams[index] == nullptr) {
         continue;
       }
 
       auto* cacheStream =
           dynamic_cast<CacheInputStream*>(inputStreams[index].get());
       if (cacheStream == nullptr) {
+        if (auto* directStream =
+                dynamic_cast<DirectInputStream*>(inputStreams[index].get())) {
+          size_t retainedBytes = 0;
+          while (retainedBytes < readSize) {
+            auto retained = directStream->nextRetained();
+            VELOX_CHECK(
+                retained.has_value(),
+                "Direct input ended after {} of {} bytes",
+                retainedBytes,
+                readSize);
+            const auto bytes = retained->size();
+            VELOX_CHECK_GT(bytes, 0, "Direct input returned an empty run");
+            VELOX_CHECK_LE(bytes, readSize - retainedBytes);
+            transfer.addBufferedRegion(
+                std::move(*retained), requests[index].dst + retainedBytes);
+            retainedBytes += bytes;
+          }
+          continue;
+        }
+        if (auto retained = input->retainedBufferedRegion(
+                requests[index].offset, readSize)) {
+          transfer.addBufferedRegion(std::move(*retained), requests[index].dst);
+          continue;
+        }
         std::vector<uint8_t> copied(readSize);
         inputStreams[index]->readFully(
             reinterpret_cast<char*>(copied.data()), readSize);
@@ -719,15 +786,15 @@ std::vector<size_t> executeDeviceReadBatch(
     }
 
     // The transfer plan now owns an independent pin for every cache fragment
-    // (or an owned copy for non-cache input), so release the input streams and
-    // their original pins before H2D begins. Staged transfers release each
-    // owner after its last fragment is packed; the direct fallback retains the
-    // owners until its CUDA completion fence.
+    // (or a retained allocation / owned copy for non-cache input). Release
+    // the input streams and their original pins before H2D begins. Staged
+    // transfers release each owner after its last fragment is packed; the
+    // direct fallback retains the owners until its CUDA completion fence.
     inputStreams.clear();
   }
 
   // Only reserve the bounded pinned arena after all storage work is complete
-  // and the transfer plan owns exact cache pins or private copied buffers.
+  // and the transfer plan owns exact cache pins or retained/copied buffers.
   // AsyncDataCache entries can be exclusive, stale-sized, cancelled, or
   // evicted between a load barrier and Next(); preparing sources first closes
   // that residency gap and guarantees no remote I/O can hold both windows.
