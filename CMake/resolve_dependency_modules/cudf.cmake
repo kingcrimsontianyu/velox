@@ -17,12 +17,12 @@ include_guard(GLOBAL)
 # 4.0 is the minimum version required by cudf
 cmake_minimum_required(VERSION 4.0)
 
-# rapids_cmake commit 179cca3 from 2026-09-17 (main branch)
+# rapids_cmake commit 008faba from 2026-10-01 (main branch)
 set(VELOX_rapids_cmake_VERSION 26.12)
-set(VELOX_rapids_cmake_COMMIT 179cca353608299e8feb99fa15f15d0d5782ddb1)
+set(VELOX_rapids_cmake_COMMIT 008fabaad824ff09281b29e9a570580487e45f05)
 set(
   VELOX_rapids_cmake_BUILD_SHA256_CHECKSUM
-  ef6a761ae894b0fd30499f44611bdea7ab1075a44be5b192345e0d73eef34fd7
+  ae971124426e74151a7c9757cb5fdd50972df0e4ae3c506be5e3e91a990d685e
 )
 set(
   VELOX_rapids_cmake_SOURCE_URL
@@ -30,12 +30,12 @@ set(
 )
 velox_resolve_dependency_url(rapids_cmake)
 
-# rmm commit 3a62b2c from 2026-09-28 (main branch)
+# rmm commit 2d64592 from 2026-10-01 (main branch)
 set(VELOX_rmm_VERSION 26.12)
-set(VELOX_rmm_COMMIT 3a62b2c64ce5e1856d98e59742c7ba81249c8718)
+set(VELOX_rmm_COMMIT 2d645925a1aea7ce8809aa57e6d78e32bdb0e36b)
 set(
   VELOX_rmm_BUILD_SHA256_CHECKSUM
-  09fffbbe56f0c419943f9ddd9df7071b96c3453855be370e1bfbbe7b0c31a190
+  1905a24d0d14570746002dcd322ac76a5975b9eefbb5ac13e454b439026b9dd5
 )
 set(VELOX_rmm_SOURCE_URL "https://github.com/rapidsai/rmm/archive/${VELOX_rmm_COMMIT}.tar.gz")
 velox_resolve_dependency_url(rmm)
@@ -53,27 +53,45 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
-# cudf commit e45d601 from 2026-09-30 (main branch)
+# cudf commit af62255 from 2026-10-02 (main branch)
 set(VELOX_cudf_VERSION 26.12 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT e45d60141dbe7a5790ee28feb8d9d10c9e0186fc)
+set(VELOX_cudf_COMMIT af6225524d845b2d2db2ace06ea1031226ef8ed1)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  64021c9dbcb307df35dc81409b7a3557da47c8bf1ca151369b4b05a4733424ec
+  6cb59cfa7315c4cb97114f0018b48f7a94df81ecbf692627a6d81632873bfd9f
 )
 set(VELOX_cudf_SOURCE_URL "https://github.com/rapidsai/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
 
-# Probe for a system UCX install. The variables are used only to gate ucxx
-# fetching below; nothing in Velox links against UCX directly yet.
-find_library(UCX_LIBRARY NAMES ucp)
-find_path(UCX_INCLUDE_DIR NAMES ucp/api/ucp.h)
-if(UCX_LIBRARY AND UCX_INCLUDE_DIR)
-  set(UCX_FOUND TRUE)
-else()
-  set(UCX_FOUND FALSE)
-endif()
-if(UCX_FOUND)
-  message(STATUS "Found UCX: ${UCX_LIBRARY} (headers: ${UCX_INCLUDE_DIR}) -- ucxx will be fetched")
+# Whether to build the experimental UCX GPU exchange transport
+# (velox/experimental/ucx-exchange) and the cuDF-side registration that selects
+# it. Off by default because no CI job builds it, so a dependency bump that
+# breaks it would otherwise break the default cuDF build on every host with a
+# system UCX. Requires a system UCX install. Declared here, next to the ucxx
+# fetch it controls, rather than with the other options. This file only runs
+# for a bundled cuDF, so the option exists only then; cache variables are
+# global, so every subdirectory sees it.
+option(
+  VELOX_ENABLE_UCX_EXCHANGE
+  "Build the experimental UCX GPU exchange transport. Requires a system UCX install."
+  OFF
+)
+
+if(VELOX_ENABLE_UCX_EXCHANGE)
+  # velox_ucx_exchange runs its own find_package(ucx REQUIRED); this probe fails
+  # the configure before cuDF is fetched and built.
+  find_library(UCX_LIBRARY NAMES ucp)
+  find_path(UCX_INCLUDE_DIR NAMES ucp/api/ucp.h)
+  if(NOT UCX_LIBRARY OR NOT UCX_INCLUDE_DIR)
+    message(
+      FATAL_ERROR
+      "VELOX_ENABLE_UCX_EXCHANGE=ON but no system UCX was found (need libucp and ucp/api/ucp.h)."
+    )
+  endif()
+  message(
+    STATUS
+    "UCX exchange enabled with ${UCX_LIBRARY} (headers: ${UCX_INCLUDE_DIR}) -- ucxx will be fetched"
+  )
   # ucxx commit 7ecd4f5 from 2026-09-29 (main branch)
   set(VELOX_ucxx_VERSION 0.53)
   set(VELOX_ucxx_COMMIT 7ecd4f55ce9a833b3f23c85a574d07db8f98e0b8)
@@ -84,7 +102,7 @@ if(UCX_FOUND)
   set(VELOX_ucxx_SOURCE_URL "https://github.com/rapidsai/ucxx/archive/${VELOX_ucxx_COMMIT}.tar.gz")
   velox_resolve_dependency_url(ucxx)
 else()
-  message(STATUS "UCX not found -- ucxx will not be fetched")
+  message(STATUS "UCX exchange disabled -- ucxx will not be fetched")
 endif()
 
 # Use block so we don't leak variables
@@ -132,7 +150,11 @@ block(SCOPE_FOR VARIABLES)
     UPDATE_DISCONNECTED 1
   )
 
-  if(UCX_FOUND)
+  FetchContent_MakeAvailable(cudf)
+
+  # cuDF does not use ucxx, and ucxx takes rapids-cmake from the declaration
+  # above, so ucxx is resolved on its own after cuDF.
+  if(VELOX_ENABLE_UCX_EXCHANGE)
     FetchContent_Declare(
       ucxx
       URL ${VELOX_ucxx_SOURCE_URL}
@@ -141,11 +163,6 @@ block(SCOPE_FOR VARIABLES)
       cpp
       UPDATE_DISCONNECTED 1
     )
-  endif()
-
-  FetchContent_MakeAvailable(cudf)
-
-  if(UCX_FOUND)
     FetchContent_MakeAvailable(ucxx)
   endif()
 

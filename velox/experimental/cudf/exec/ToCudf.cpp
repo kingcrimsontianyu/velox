@@ -27,8 +27,12 @@
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/JitExpression.h"
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+#include "velox/experimental/ucx-exchange/UcxExchangeRegistration.h"
+#endif
 
 #include "folly/Conv.h"
+#include "velox/common/base/Exceptions.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -364,10 +368,30 @@ void registerCudf() {
     registerJitEvaluator(CudfConfig::getInstance().jitExpressionPriority);
   }
 
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+  // Advertise the UCX transport only when this process is configured to run it,
+  // and only once the memory resources and the driver adapter it relies on are
+  // in place, so that a registerCudf() that fails part way leaves no kUcx
+  // behind; unregisterCudf() withdraws it first. Whether a given node uses it
+  // is decided by the plan, not here. The registration lives in the transport's
+  // own module; cuDF only decides when to call it, because today cuDF is the
+  // only producer of UCX plans.
+  if (CudfConfig::getInstance().exchange) {
+    ucx_exchange::registerUcxTransports();
+  }
+#endif
+
   isCudfRegistered = true;
 }
 
 void unregisterCudf() {
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+  // Unconditionally, whether or not CudfConfig::exchange was set when
+  // registerCudf() ran: the registries are process-global and erase() is a
+  // no-op for an absent key, so this must not depend on config that may have
+  // changed in between.
+  ucx_exchange::unregisterUcxTransports();
+#endif
   // Reset the any_resource copies before the adaptors they were copied from,
   // so that the wrapped upstream resources are released here.
   output_mr_.reset();
@@ -411,8 +435,22 @@ void CudfConfig::initialize(
     outputMemoryResource = config[kCudfOutputMr];
   }
   if (config.find(kCudfBatchSizeMinThreshold) != config.end()) {
-    batchSizeMinThreshold =
+    const auto targetRows =
         folly::to<int32_t>(config[kCudfBatchSizeMinThreshold]);
+    VELOX_USER_CHECK_GT(
+        targetRows, 0, "cuDF BatchConcat minimum row target must be positive");
+    batchSizeMinThreshold = targetRows;
+  }
+  if (config.find(kCudfBatchSizeMinBytes) != config.end()) {
+    // tryTo so that a negative or malformed value is a user error, not a
+    // folly::ConversionError.
+    const auto& value = config[kCudfBatchSizeMinBytes];
+    const auto targetBytes = folly::tryTo<uint64_t>(value);
+    VELOX_USER_CHECK(
+        targetBytes.hasValue() && targetBytes.value() > 0,
+        "cuDF BatchConcat minimum byte target must be a positive integer: {}",
+        value);
+    batchSizeMinBytes = targetBytes.value();
   }
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =
