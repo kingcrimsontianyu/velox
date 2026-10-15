@@ -50,7 +50,6 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -534,34 +533,16 @@ bool CudfSplitReader::hasSplitSpecificPushdownFilter() const {
 
 namespace {
 
-void recordIoTime(
-    const std::shared_ptr<IoStats>& ioStats,
-    const char* name,
-    std::chrono::steady_clock::time_point start) {
-  if (ioStats) {
-    ioStats->addCounter(
-        name,
-        RuntimeCounter(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start)
-                .count(),
-            RuntimeCounter::Unit::kNanos));
-  }
-}
-
-// Opens the KvikIO datasource for 'split' and wraps it in the AsyncDataCache
-// when caching applies. Without the whole-file size KvikIO issues a
-// synchronous size probe on open, even when every requested byte is cached,
-// so the size forwarded by the coordinator is passed through. The range hints
-// stay zero: the datasource must address the full file, footer included, even
-// when this split covers only part of it.
 std::unique_ptr<cudf::io::datasource> makeKvikioDataSource(
     const CudfHiveConnectorSplit& split,
     const std::shared_ptr<IoStats>& ioStats) {
   const auto knownSize = knownKvikioFileSize(split);
-  const auto start = std::chrono::steady_clock::now();
-  auto source = cudf::io::datasource::create(split.filePath, 0, 0, knownSize);
-  recordIoTime(ioStats, "cudfKvikioDataSourceOpenNanos", start);
+  // Open precedes the cache wrapper. Without the whole-file size, KvikIO
+  // issues a synchronous HEAD even when all requested bytes are cached.
+  // Describe the whole file (offset 0, no size estimate), not this split's
+  // range: the reader also needs the footer at the end of the file.
+  auto source = cudf::io::datasource::create(
+      split.filePath, /*offset=*/0, /*max_size_estimate=*/0, knownSize);
   if (ioStats) {
     ioStats->addCounter(
         knownSize.has_value() ? "cudfKvikioKnownSizeOpens"
@@ -723,9 +704,7 @@ void CudfSplitReader::fileMetaDatas() {
   }
 
   // Setup the datasource
-  const auto setupStart = std::chrono::steady_clock::now();
   setupCudfDataSource();
-  recordIoTime(ioStats_, "cudfSplitReaderDataSourceSetupNanos", setupStart);
 
   // Check that the datasource is set up
   VELOX_CHECK_NOT_NULL(
@@ -735,9 +714,7 @@ void CudfSplitReader::fileMetaDatas() {
   // Wrap the existing datasource without transferring ownership.
   std::vector<std::unique_ptr<cudf::io::datasource>> sources;
   sources.push_back(cudf::io::datasource::create(dataSource_.get()));
-  const auto footerStart = std::chrono::steady_clock::now();
   fileMetaData_ = cudf::io::read_parquet_footers(sources);
-  recordIoTime(ioStats_, "cudfSplitReaderFooterReadNanos", footerStart);
   VELOX_CHECK_GE(
       fileMetaData_.size(),
       1,
